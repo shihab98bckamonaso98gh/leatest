@@ -5,10 +5,9 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ✅ Accounts button – Log In / Log Out (per site)
 ✅ Admin Users Status – aggregate stats
 ✅ Broadcast – send any message to all users
-✅ Database persistence for stats, credentials
-✅ All buttons have colour (primary / success / danger)
-✅ Log Out now supported
-✅ Fixed missing format_balance_message function
+✅ Persistent database with volume support
+✅ Fully Railway‑ready with Dockerfile (see instructions)
+✅ All buttons coloured (primary / success / danger)
 """
 
 import asyncio
@@ -92,6 +91,13 @@ HEALTH_PORT = int(os.getenv("PORT", "0"))
 _admin_users_env = os.getenv("ADMIN_USERS", "").strip()
 ADMIN_USERS_FILE = "admin_users.json"
 
+# ── Persistent data directory (optional Railway volume) ──────
+DATA_DIR = os.getenv("DATA_DIR", ".")
+DB_FILE = os.path.join(DATA_DIR, "bot_data.db")
+RATE_CONFIG_FILE = os.path.join(DATA_DIR, "rate_config.json")
+WITHDRAW_CONFIG_FILE = os.path.join(DATA_DIR, "withdraw_config.json")
+ADMIN_USERS_FILE = os.path.join(DATA_DIR, "admin_users.json")
+
 def _load_admins() -> Set[int]:
     s = set()
     if _admin_users_env:
@@ -111,10 +117,6 @@ def _save_admins(admins: Set[int]):
 
 ADMIN_USERS = _load_admins()
 CHANGE_NUMBER_DELAY = 0   # seconds
-
-# ── Rates config files ─────────────────────────────────────────
-RATE_CONFIG_FILE = "rate_config.json"
-WITHDRAW_CONFIG_FILE = "withdraw_config.json"
 
 def load_sms_rate():
     if os.path.exists(RATE_CONFIG_FILE):
@@ -148,12 +150,10 @@ SMS_RATE_BDT = load_sms_rate()
 MIN_WITHDRAW_BDT = load_min_withdraw()
 
 # ── Database (Balance + Withdrawals + Stats + Credentials) ──────
-DB_FILE = "bot_data.db"
 EXCHANGE_RATE = 125.0   # 1 USD = 125 BDT
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
-        # Users table – extend with stats columns
         conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -169,7 +169,6 @@ def init_db():
                 numbers_used INTEGER DEFAULT 0
             )
         ''')
-        # Migrate older tables (in case they lack new columns)
         for col, col_def in [
             ('total_otps', 'INTEGER DEFAULT 0'),
             ('today_otps', 'INTEGER DEFAULT 0'),
@@ -181,9 +180,7 @@ def init_db():
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {col_def}")
             except sqlite3.OperationalError:
-                pass  # column already exists
-
-        # Withdrawals table
+                pass
         conn.execute('''
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,7 +193,6 @@ def init_db():
                 approved_at TIMESTAMP
             )
         ''')
-        # Credentials table
         conn.execute('''
             CREATE TABLE IF NOT EXISTS user_credentials (
                 user_id INTEGER,
@@ -366,7 +362,6 @@ def get_credentials(user_id: int, site: str) -> Optional[Tuple[str, str]]:
 def remove_credentials(user_id: int, site: str):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('DELETE FROM user_credentials WHERE user_id = ? AND site = ?', (user_id, site))
-    # Also close per‑user browser page
     async def _close_user_page():
         if user_id in _user_pages:
             pages = _user_pages[user_id]
@@ -417,9 +412,7 @@ _playwright_obj = None
 _browser        = None
 _browser_lock   = asyncio.Lock()
 _page_lock      = asyncio.Lock()
-# Global default pages (for users with no custom credentials)
 _global_pages: Dict[str, Page] = {}
-# Per‑user pages for custom credentials
 _user_pages: Dict[int, Dict[str, Page]] = {}
 
 # Fake details data
@@ -549,7 +542,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer("You are not yet a member of the channel.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════
-#  BROWSER / SCRAPER – now supports per‑user credentials
+#  BROWSER / SCRAPER
 # ═══════════════════════════════════════════════════════════════
 async def _ensure_playwright():
     global _playwright_obj, _browser
@@ -579,17 +572,11 @@ async def _login_with_credentials(page: Page, site: str, email: str, password: s
     return False
 
 async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
-    """
-    Returns a logged‑in Page for the given site.
-    If user_id is provided and has custom credentials, a dedicated page is used (no earnings).
-    Otherwise the global default page is returned.
-    """
     await _ensure_playwright()
     creds = None
     if user_id:
         creds = get_credentials(user_id, site)
     if creds:
-        # Use per‑user page
         user_pages = _user_pages.setdefault(user_id, {})
         page = user_pages.get(site)
         if page is None or page.is_closed():
@@ -605,13 +592,11 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
                 del user_pages[site]
                 raise Exception(f"Login failed for {site} with custom credentials")
         else:
-            # check if still logged in
             if page.url and ("login" in page.url or "auth" in page.url):
                 success = await _login_with_credentials(page, site, creds[0], creds[1])
                 if not success:
                     raise Exception(f"Re‑login failed for {site}")
     else:
-        # Use global default page
         page = _global_pages.get(site)
         if page is None or page.is_closed():
             context = await _browser.new_context(
@@ -624,7 +609,6 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
         else:
             if page.url and ("login" in page.url or "auth" in page.url):
                 await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD)
-    # Navigate to dialer
     await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
     return page
 
@@ -632,7 +616,6 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
     page = await _ensure_page_logged_in(site, user_id)
     async with _page_lock:
         try:
-            # Ensure we are on dialer page
             if "/dialer/" not in page.url:
                 await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
             first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
@@ -690,7 +673,7 @@ async def poll_otp(number: str, site: str, user_id: int = None) -> Optional[str]
             return None
 
 # ═══════════════════════════════════════════════════════════════
-#  MONITOR TASK – now respects custom credentials (no earnings)
+#  MONITOR TASK
 # ═══════════════════════════════════════════════════════════════
 async def monitor_number(app: Application, uid: int, number: str, country: str, operator: str, site: str):
     loop = asyncio.get_event_loop()
@@ -707,7 +690,6 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
                 s["last_otp"] = clean_otp
                 clean_msg = _clean_full_msg(full_msg)
                 safe_msg = escape_markdown(clean_msg, version=1)
-
                 if not custom:
                     balance_before = get_user_balance(uid)
                     if SMS_RATE_BDT > 0:
@@ -717,7 +699,6 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
                     bal_line = f"💰 Balance: {balance_before:.2f} BDT → {balance_after:.2f} BDT"
                 else:
                     bal_line = "💡 (using your own account – no earnings)"
-
                 user_text = (
                     f"📩 {country} Message Received!\n\n"
                     f"📞 Number: `+{number}`\n"
@@ -725,15 +706,12 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
                     f"💬 Message: {safe_msg}\n\n"
                     f"{bal_line}"
                 )
-
                 if COPY_SUPPORTED:
                     user_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", copy_text=CopyTextButton(text=clean_otp))]])
                 else:
                     user_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", callback_data=f"copy_otp_{clean_otp}", style="primary")]])
-
                 try: await app.bot.send_message(uid, user_text, parse_mode="Markdown", reply_markup=user_kb)
                 except Exception as e: log.error(f"❌ DM OTP error: {e}")
-
                 masked_num = _mask_number(f"+{number}")
                 group_text = f"📨 {country} OTP Received\n━━━━━━━━━━━━━━━━\n📞 Number: {masked_num}\n🔑 OTP: {clean_otp}\n\n💬 {clean_msg}\n━━━━━━━━━━━━━━━━"
                 bot_link = f"https://t.me/{bot_user.username}?start=start"
@@ -743,7 +721,7 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
         await asyncio.sleep(POLL_INTERVAL)
 
 # ═══════════════════════════════════════════════════════════════
-#  KEYBOARDS – all coloured + Accounts options
+#  KEYBOARDS (coloured)
 # ═══════════════════════════════════════════════════════════════
 def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
     btns = [
@@ -827,9 +805,7 @@ def logout_site_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("VoltxSMS", callback_data="logout_site_voltxsms", style="danger")]
     ])
 
-# ═══════════════════════════════════════════════════════════════
-#  FORMAT BALANCE MESSAGE (was missing, now added)
-# ═══════════════════════════════════════════════════════════════
+# ── Format balance message ────────────────────────────────────
 def format_balance_message(user_id: int) -> str:
     balance = get_user_balance(user_id)
     wallet = get_user_wallet(user_id)
@@ -957,22 +933,17 @@ async def cb_logout_site_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     query = update.callback_query; await query.answer()
     data = query.data
     if not data.startswith("logout_site_"): return
-    site = data[12:]  # "stexsms" or "voltxsms"
+    site = data[12:]
     uid = query.from_user.id
     remove_credentials(uid, site)
     await query.message.reply_text(f"✅ Logged out from {SITES[site]['name']}.", reply_markup=main_menu_kb(uid))
 
-# ── Login site callback ──────────────────────────────────────
 async def cb_login_site_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
-    site = query.data.split('_')[2]  # login_site_stexsms -> stexsms
+    site = query.data.split('_')[2]
     ctx.user_data['login_site'] = site
     ctx.user_data['awaiting_login_email'] = True
-    await query.message.reply_text(
-        f"📧 Enter your *{SITES[site]['name']}* email address:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await query.message.reply_text(f"📧 Enter your *{SITES[site]['name']}* email address:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
 # ── Withdraw callbacks ──────────────────────────────────────
 async def cb_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1100,7 +1071,7 @@ async def _update_2fa_countdown(message, code: str):
         remaining -= 1
 
 # ═══════════════════════════════════════════════════════════════
-#  CONVERSATION HANDLERS – extended with new states
+#  CONVERSATION HANDLERS
 # ═══════════════════════════════════════════════════════════════
 MAIN_MENU, SITE_MENU, AWAIT_RANGE, ADMIN_MENU, SET_INTERVAL, ADMIN_SET_MENU, ADD_ADMIN_INPUT, \
 AWAIT_2FA_SECRET, SET_RATE, SET_WITHDRAW_RATE, \
@@ -1117,7 +1088,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _check_membership(update, ctx): return ConversationHandler.END
 
-    # Withdraw flow
     if ctx.user_data.get('awaiting_withdraw_account'):
         account = update.message.text.strip()
         ctx.user_data['withdraw_account'] = account
@@ -1154,7 +1124,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Withdrawal request submitted.", reply_markup=main_menu_kb(uid))
         return MAIN_MENU
 
-    # Wallet set flow
     if ctx.user_data.get('awaiting_wallet_number'):
         wallet_type = ctx.user_data.get('wallet_type')
         number = update.message.text.strip()
@@ -1169,7 +1138,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Wallet updated.", reply_markup=main_menu_kb(uid))
         return MAIN_MENU
 
-    # Login email flow
     if ctx.user_data.get('awaiting_login_email'):
         email = update.message.text.strip()
         site = ctx.user_data.get('login_site')
@@ -1182,7 +1150,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔑 Now enter your *password*:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         return LOGIN_PASSWORD
 
-    # Login password flow (handled in separate state)
     if ctx.user_data.get('awaiting_login_password'):
         password = update.message.text.strip()
         site = ctx.user_data.get('login_site')
@@ -1254,7 +1221,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADMIN_MENU
     return MAIN_MENU
 
-# New login password handler (called when state is LOGIN_PASSWORD)
 async def login_password_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     password = update.message.text.strip()
@@ -1521,7 +1487,6 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv)
-    # Callback handlers
     app.add_handler(CallbackQueryHandler(cb_change_number, pattern="^change_number$"))
     app.add_handler(CallbackQueryHandler(cb_copy_fallback, pattern="^copy_"))
     app.add_handler(CallbackQueryHandler(verify_membership_callback, pattern="^verify_membership$"))
