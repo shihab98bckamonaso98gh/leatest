@@ -3,7 +3,7 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ============================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
 ✅ Silent mode: only essential startup logs are shown (DB, health, delay, bot running)
-✅ All other operational logs set to DEBUG
+✅ All other operational logs suppressed (logger level set to INFO)
 ✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
 ✅ Coloured buttons (primary / success / danger)
 ✅ Persistent SQLite database via $DATA_DIR
@@ -392,7 +392,7 @@ POLL_INTERVAL   = 3
 MONITOR_TIMEOUT = 480
 
 # ═══════════════════════════════════════════════════════════════
-#  LOGGING – only essential INFO, rest DEBUG
+#  LOGGING – only essential INFO, rest DEBUG (suppressed)
 # ═══════════════════════════════════════════════════════════════
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -402,7 +402,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logging.getLogger("telegram._bot").setLevel(logging.WARNING)
 log = logging.getLogger("smsbot")
-log.setLevel(logging.DEBUG)  # But we'll change specific messages to INFO only where needed
+log.setLevel(logging.INFO)  # Only show INFO and above – debug messages are hidden
 
 # ═══════════════════════════════════════════════════════════════
 #  GLOBAL STATE
@@ -451,7 +451,7 @@ def start_health_server(port: int):
     log.info(f"🌐 Health server listening on port {port}")
 
 # ═══════════════════════════════════════════════════════════════
-#  HELPERS – changed many INFO logs to DEBUG
+#  HELPERS – debug logs are now hidden unless level changed
 # ═══════════════════════════════════════════════════════════════
 def _stop_monitor(uid: int):
     s = user_sessions.get(uid, {})
@@ -542,7 +542,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer("You are not yet a member of the channel.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════
-#  BROWSER / SCRAPER – reduced log level for routine messages
+#  BROWSER / SCRAPER – routine logs are now hidden
 # ═══════════════════════════════════════════════════════════════
 async def _ensure_playwright():
     global _playwright_obj, _browser
