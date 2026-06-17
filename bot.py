@@ -2,9 +2,8 @@
 STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ============================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
-✅ Clean logs: only essential startup logs shown
-✅ New: "📐 Range" button opens Telegram Mini App directly (URL set by admin)
-✅ Admin can set the mini‑app URL via "Set Link" button
+✅ Silent mode: only essential startup logs are shown (DB, health, delay, bot running)
+✅ All other operational logs set to DEBUG
 ✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
 ✅ Coloured buttons (primary / success / danger)
 ✅ Persistent SQLite database via $DATA_DIR
@@ -42,7 +41,6 @@ from telegram import (
     InlineKeyboardButton,
     ReplyKeyboardRemove,
     ChatMember,
-    WebAppInfo,
 )
 from telegram.helpers import escape_markdown
 from telegram.ext import (
@@ -98,7 +96,6 @@ DB_FILE = os.path.join(DATA_DIR, "bot_data.db")
 RATE_CONFIG_FILE = os.path.join(DATA_DIR, "rate_config.json")
 WITHDRAW_CONFIG_FILE = os.path.join(DATA_DIR, "withdraw_config.json")
 ADMIN_USERS_FILE = os.path.join(DATA_DIR, "admin_users.json")
-RANGE_LINK_FILE = os.path.join(DATA_DIR, "range_link.json")
 
 def _load_admins() -> Set[int]:
     s = set()
@@ -148,23 +145,8 @@ def save_min_withdraw(min_val: float):
     with open(WITHDRAW_CONFIG_FILE, 'w') as f:
         json.dump({'min': min_val}, f)
 
-def load_range_link() -> str:
-    if os.path.exists(RANGE_LINK_FILE):
-        try:
-            with open(RANGE_LINK_FILE, 'r') as f:
-                data = json.load(f)
-                return data.get('url', '')
-        except:
-            pass
-    return ''
-
-def save_range_link(url: str):
-    with open(RANGE_LINK_FILE, 'w') as f:
-        json.dump({'url': url}, f)
-
 SMS_RATE_BDT = load_sms_rate()
 MIN_WITHDRAW_BDT = load_min_withdraw()
-RANGE_LINK = load_range_link()
 
 # ── Database (Balance + Withdrawals + Stats + Credentials) ──────
 EXCHANGE_RATE = 125.0   # 1 USD = 125 BDT
@@ -420,7 +402,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logging.getLogger("telegram._bot").setLevel(logging.WARNING)
 log = logging.getLogger("smsbot")
-log.setLevel(logging.DEBUG)  # Allow DEBUG, but root config prevents display of DEBUG
+log.setLevel(logging.DEBUG)  # But we'll change specific messages to INFO only where needed
 
 # ═══════════════════════════════════════════════════════════════
 #  GLOBAL STATE
@@ -469,7 +451,7 @@ def start_health_server(port: int):
     log.info(f"🌐 Health server listening on port {port}")
 
 # ═══════════════════════════════════════════════════════════════
-#  HELPERS
+#  HELPERS – changed many INFO logs to DEBUG
 # ═══════════════════════════════════════════════════════════════
 def _stop_monitor(uid: int):
     s = user_sessions.get(uid, {})
@@ -560,7 +542,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer("You are not yet a member of the channel.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════
-#  BROWSER / SCRAPER
+#  BROWSER / SCRAPER – reduced log level for routine messages
 # ═══════════════════════════════════════════════════════════════
 async def _ensure_playwright():
     global _playwright_obj, _browser
@@ -753,20 +735,14 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
         await asyncio.sleep(POLL_INTERVAL)
 
 # ═══════════════════════════════════════════════════════════════
-#  KEYBOARDS (coloured) – Range button now opens mini app directly
+#  KEYBOARDS (coloured)
 # ═══════════════════════════════════════════════════════════════
 def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
     btns = [
         [KeyboardButton("📡 Get Number", style="success"), KeyboardButton("🔑 Get 2FA", style="primary")],
         [KeyboardButton("📋 Fake Details", style="primary"), KeyboardButton("💰 Balance", style="success")],
-        [KeyboardButton("📊 Status", style="success"), KeyboardButton("👤 Accounts", style="primary")],
+        [KeyboardButton("📊 Status", style="success"), KeyboardButton("👤 Accounts", style="primary")]
     ]
-    # Range button: if link is set, open Telegram Mini App directly
-    if RANGE_LINK:
-        range_btn = [KeyboardButton("📐 Range", web_app=WebAppInfo(url=RANGE_LINK), style="primary")]
-    else:
-        range_btn = [KeyboardButton("📐 Range", style="primary")]
-    btns.append(range_btn)
     if _is_admin(uid):
         btns.append([KeyboardButton("⚙️ Admin Panel", style="primary")])
     return ReplyKeyboardMarkup(btns, resize_keyboard=True)
@@ -782,8 +758,7 @@ def admin_menu_kb(uid: int) -> ReplyKeyboardMarkup:
         [KeyboardButton("Interval", style="primary")],
         [KeyboardButton("Set SMS Rate", style="success"), KeyboardButton("Set Withdraw Rate", style="primary")],
         [KeyboardButton("Pending", style="primary"), KeyboardButton("Approved", style="success")],
-        [KeyboardButton("Users Status", style="success"), KeyboardButton("Broadcast", style="primary")],
-        [KeyboardButton("Set Link", style="primary")]
+        [KeyboardButton("Users Status", style="success"), KeyboardButton("Broadcast", style="primary")]
     ]
     if _is_owner(uid):
         btns.append([KeyboardButton("Admin Set", style="primary")])
@@ -1110,11 +1085,11 @@ async def _update_2fa_countdown(message, code: str):
         remaining -= 1
 
 # ═══════════════════════════════════════════════════════════════
-#  CONVERSATION HANDLERS (Range button now opens mini app directly)
+#  CONVERSATION HANDLERS
 # ═══════════════════════════════════════════════════════════════
 MAIN_MENU, SITE_MENU, AWAIT_RANGE, ADMIN_MENU, SET_INTERVAL, ADMIN_SET_MENU, ADD_ADMIN_INPUT, \
 AWAIT_2FA_SECRET, SET_RATE, SET_WITHDRAW_RATE, \
-LOGIN_EMAIL, LOGIN_PASSWORD, BROADCAST_AWAIT, SET_LINK = range(14)
+LOGIN_EMAIL, LOGIN_PASSWORD, BROADCAST_AWAIT = range(13)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1127,7 +1102,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _check_membership(update, ctx): return ConversationHandler.END
 
-    # Withdraw flow
     if ctx.user_data.get('awaiting_withdraw_account'):
         account = update.message.text.strip()
         ctx.user_data['withdraw_account'] = account
@@ -1164,7 +1138,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Withdrawal request submitted.", reply_markup=main_menu_kb(uid))
         return MAIN_MENU
 
-    # Wallet set flow
     if ctx.user_data.get('awaiting_wallet_number'):
         wallet_type = ctx.user_data.get('wallet_type')
         number = update.message.text.strip()
@@ -1179,7 +1152,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Wallet updated.", reply_markup=main_menu_kb(uid))
         return MAIN_MENU
 
-    # Login email flow
     if ctx.user_data.get('awaiting_login_email'):
         email = update.message.text.strip()
         site = ctx.user_data.get('login_site')
@@ -1192,7 +1164,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔑 Now enter your *password*:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         return LOGIN_PASSWORD
 
-    # Login password flow
     if ctx.user_data.get('awaiting_login_password'):
         password = update.message.text.strip()
         site = ctx.user_data.get('login_site')
@@ -1252,17 +1223,12 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text == "👤 Accounts":
         await update.message.reply_text("👤 *Accounts Management*\nChoose an action:", parse_mode="Markdown", reply_markup=accounts_options_kb())
         return MAIN_MENU
-    elif text == "📐 Range":
-        # This only triggers when RANGE_LINK is not set (regular button sends text)
-        await update.message.reply_text("❌ Range link not set by admin yet.")
-        return MAIN_MENU
     elif text == "⚙️ Admin Panel" and _is_admin(uid):
         await update.message.reply_text(
             f"⚙️ *Admin Panel*\n"
             f"Change‑Number delay: `{CHANGE_NUMBER_DELAY}`s\n"
             f"SMS Rate: `{SMS_RATE_BDT}` BDT/OTP\n"
-            f"Min Withdraw: `{MIN_WITHDRAW_BDT}` BDT\n"
-            f"Range Link: `{RANGE_LINK or 'Not set'}`",
+            f"Min Withdraw: `{MIN_WITHDRAW_BDT}` BDT",
             parse_mode="Markdown",
             reply_markup=admin_menu_kb(uid)
         )
@@ -1354,27 +1320,12 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif text == "Broadcast":
         await update.message.reply_text("📣 Send the message you want to broadcast (text, photo, video, document, etc.). Type /cancel to abort.", reply_markup=ReplyKeyboardRemove())
         return BROADCAST_AWAIT
-    elif text == "Set Link":
-        await update.message.reply_text("🔗 Send the URL for the Range Mini App:", reply_markup=ReplyKeyboardRemove())
-        return SET_LINK
     elif text == "Admin Set" and _is_owner(uid):
         await update.message.reply_text("⚙️ *Admin Management*", parse_mode="Markdown", reply_markup=admin_set_menu_kb())
         return ADMIN_SET_MENU
     elif text == "🔙 Back":
         await update.message.reply_text("🏠 Main menu:", reply_markup=main_menu_kb(uid))
         return MAIN_MENU
-    return ADMIN_MENU
-
-async def set_link_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global RANGE_LINK
-    uid = update.effective_user.id
-    url = update.message.text.strip()
-    if not url.startswith(('http://', 'https://')):
-        await update.message.reply_text("❌ Invalid URL. Must start with http:// or https://", reply_markup=admin_menu_kb(uid))
-        return ADMIN_MENU
-    save_range_link(url)
-    RANGE_LINK = url
-    await update.message.reply_text(f"✅ Range link set to:\n`{url}`", parse_mode="Markdown", reply_markup=admin_menu_kb(uid))
     return ADMIN_MENU
 
 async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1532,6 +1483,7 @@ def main():
     if HEALTH_PORT > 0:
         start_health_server(HEALTH_PORT)
 
+    # Add a short startup delay to avoid race condition with previous container on Railway
     log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
     time.sleep(5)
 
@@ -1552,7 +1504,6 @@ def main():
             AWAIT_2FA_SECRET:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa_secret)],
             LOGIN_PASSWORD:    [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password_handler)],
             BROADCAST_AWAIT:   [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_handler)],
-            SET_LINK:          [MessageHandler(filters.TEXT & ~filters.COMMAND, set_link_handler)],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
         allow_reentry=True,
