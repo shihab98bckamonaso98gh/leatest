@@ -2,6 +2,7 @@
 STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ============================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
+✅ Conflict fix: 5s startup delay + clean polling shutdown
 ✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
 ✅ Coloured buttons (primary / success / danger)
 ✅ Persistent SQLite database via $DATA_DIR
@@ -1454,7 +1455,7 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception:", exc_info=ctx.error)
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN (with early token check)
+#  MAIN (with early token check and startup delay)
 # ═══════════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN:
@@ -1464,6 +1465,10 @@ def main():
     init_db()
     if HEALTH_PORT > 0:
         start_health_server(HEALTH_PORT)
+
+    # Add a short startup delay to avoid race condition with previous container on Railway
+    log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
+    time.sleep(5)
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
@@ -1510,6 +1515,7 @@ def main():
     async def shutdown():
         log.info("🛑 Shutting down bot...")
         await app.stop()
+        await app.shutdown()
         async with _browser_lock:
             if _browser:
                 await _browser.close()
