@@ -392,7 +392,7 @@ POLL_INTERVAL   = 3
 MONITOR_TIMEOUT = 480
 
 # ═══════════════════════════════════════════════════════════════
-#  LOGGING – only essential INFO, rest DEBUG (suppressed)
+#  LOGGING – essential INFO only, no DEBUG from smsbot
 # ═══════════════════════════════════════════════════════════════
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -402,7 +402,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logging.getLogger("telegram._bot").setLevel(logging.WARNING)
 log = logging.getLogger("smsbot")
-log.setLevel(logging.INFO)  # Only show INFO and above – debug messages are hidden
+log.setLevel(logging.INFO)   # DEBUG messages are now completely hidden
 
 # ═══════════════════════════════════════════════════════════════
 #  GLOBAL STATE
@@ -451,14 +451,14 @@ def start_health_server(port: int):
     log.info(f"🌐 Health server listening on port {port}")
 
 # ═══════════════════════════════════════════════════════════════
-#  HELPERS – debug logs are now hidden unless level changed
+#  HELPERS – all debug logs are now suppressed
 # ═══════════════════════════════════════════════════════════════
 def _stop_monitor(uid: int):
     s = user_sessions.get(uid, {})
     task = s.get("monitor_task")
     if task and not task.done():
         task.cancel()
-        log.debug(f"🛑 Monitor cancelled for uid={uid}")
+        # log.debug suppressed
 
 def _is_owner(uid: int) -> bool: return uid == OWNER_USER_ID
 def _is_admin(uid: int) -> bool: return uid in ADMIN_USERS or _is_owner(uid)
@@ -542,7 +542,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer("You are not yet a member of the channel.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════
-#  BROWSER / SCRAPER – routine logs are now hidden
+#  BROWSER / SCRAPER – routine logs hidden
 # ═══════════════════════════════════════════════════════════════
 async def _ensure_playwright():
     global _playwright_obj, _browser
@@ -558,23 +558,20 @@ async def _ensure_playwright():
 
 async def _login_with_credentials(page: Page, site: str, email: str, password: str) -> bool:
     site_cfg = SITES[site]
-    log.debug(f"🔐 Logging in to {site_cfg['name']}...")
+    # debug logs removed (would be suppressed anyway)
     await page.goto(site_cfg["login_url"], wait_until="networkidle", timeout=30000)
     await page.fill("input[type='email']", email)
     await page.fill("input[type='password']", password)
     await page.click("button[type='submit']")
     try:
         await page.wait_for_url(lambda url: "auth" not in url and "login" not in url, timeout=60000)
-        log.debug(f"✅ {site_cfg['name']} login successful")
         return True
     except Exception:
         if "/dialer/" in page.url: return True
         try:
             await page.wait_for_selector("table.gn-tbl, input.gn-range-input", timeout=5000)
-            log.debug(f"✅ {site_cfg['name']} login confirmed by element")
             return True
         except Exception: pass
-    log.debug(f"⚠️ Login not confirmed for {site_cfg['name']}")
     return False
 
 async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
@@ -599,7 +596,6 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
                 raise Exception(f"Login failed for {site} with custom credentials")
         else:
             if page.url and ("login" in page.url or "auth" in page.url):
-                log.debug(f"🔄 Re‑logging to {SITES[site]['name']}")
                 success = await _login_with_credentials(page, site, creds[0], creds[1])
                 if not success:
                     raise Exception(f"Re‑login failed for {site}")
@@ -615,7 +611,6 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
             await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD)
         else:
             if page.url and ("login" in page.url or "auth" in page.url):
-                log.debug(f"🔄 Session stale, re‑logging…")
                 await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD)
     await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
     return page
@@ -641,7 +636,6 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
                     if(n&&n.textContent.trim().replace(/^\\+/,'')!==old)return true;break;}return false;}""",
                     arg=old_number or "", timeout=15000)
             except PlaywrightTimeoutError:
-                log.debug(f"⏳ No new number appeared for range {range_str} on {site}")
                 return None
 
             first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
@@ -651,7 +645,6 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
             operator = (await first_row.locator(".gn-meta-sub").first.inner_text()).strip() if await first_row.locator(".gn-meta-sub").count() else "Unknown"
             operator = re.sub(r"\s+", " ", operator).strip()
             if not number: return None
-            log.debug(f"📞 Got number: +{number} | {country} | {operator}")
             return {"number":number,"country":country,"operator":operator}
         except Exception as e:
             log.error(f"❌ fetch_number error: {e}")
@@ -1340,7 +1333,8 @@ async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.copy(chat_id=user_id)
             success += 1
         except Exception as e:
-            log.debug(f"Broadcast failed for {user_id}: {e}")
+            # log suppressed
+            pass
     await update.message.reply_text(f"✅ Broadcast sent to {success}/{len(all_users)} users.", reply_markup=admin_menu_kb(uid))
     return ADMIN_MENU
 
@@ -1483,7 +1477,7 @@ def main():
     if HEALTH_PORT > 0:
         start_health_server(HEALTH_PORT)
 
-    # Add a short startup delay to avoid race condition with previous container on Railway
+    # Startup delay to prevent polling conflict on Railway redeploy
     log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
     time.sleep(5)
 
