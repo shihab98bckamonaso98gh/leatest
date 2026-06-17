@@ -1,13 +1,10 @@
 """
 STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ============================================================================
-✅ Status button – personal stats
-✅ Accounts button – Log In / Log Out (per site)
-✅ Admin Users Status – aggregate stats
-✅ Broadcast – send any message to all users
-✅ Persistent database with volume support
-✅ Fully Railway‑ready with Dockerfile (see instructions)
-✅ All buttons coloured (primary / success / danger)
+✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
+✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
+✅ Coloured buttons (primary / success / danger)
+✅ Persistent SQLite database via $DATA_DIR
 """
 
 import asyncio
@@ -89,7 +86,6 @@ HEALTH_PORT = int(os.getenv("PORT", "0"))
 
 # Admin users – loaded from .env + persisted file
 _admin_users_env = os.getenv("ADMIN_USERS", "").strip()
-ADMIN_USERS_FILE = "admin_users.json"
 
 # ── Persistent data directory (optional Railway volume) ──────
 DATA_DIR = os.getenv("DATA_DIR", ".")
@@ -1458,9 +1454,13 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception:", exc_info=ctx.error)
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN
+#  MAIN (with early token check)
 # ═══════════════════════════════════════════════════════════════
 def main():
+    if not BOT_TOKEN:
+        log.critical("❌ BOT_TOKEN is not set. Please set it in your Railway environment variables.")
+        sys.exit(1)
+
     init_db()
     if HEALTH_PORT > 0:
         start_health_server(HEALTH_PORT)
