@@ -3,7 +3,7 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ============================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
 ✅ Clean logs: only essential startup logs shown
-✅ New: "📐 Range" button opens a Telegram Mini App (URL set by admin)
+✅ New: "📐 Range" button opens Telegram Mini App directly (URL set by admin)
 ✅ Admin can set the mini‑app URL via "Set Link" button
 ✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
 ✅ Coloured buttons (primary / success / danger)
@@ -753,15 +753,20 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
         await asyncio.sleep(POLL_INTERVAL)
 
 # ═══════════════════════════════════════════════════════════════
-#  KEYBOARDS (coloured) – added Range button
+#  KEYBOARDS (coloured) – Range button now opens mini app directly
 # ═══════════════════════════════════════════════════════════════
 def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
     btns = [
         [KeyboardButton("📡 Get Number", style="success"), KeyboardButton("🔑 Get 2FA", style="primary")],
         [KeyboardButton("📋 Fake Details", style="primary"), KeyboardButton("💰 Balance", style="success")],
         [KeyboardButton("📊 Status", style="success"), KeyboardButton("👤 Accounts", style="primary")],
-        [KeyboardButton("📐 Range", style="primary")]
     ]
+    # Range button: if link is set, open Telegram Mini App directly
+    if RANGE_LINK:
+        range_btn = [KeyboardButton("📐 Range", web_app=WebAppInfo(url=RANGE_LINK), style="primary")]
+    else:
+        range_btn = [KeyboardButton("📐 Range", style="primary")]
+    btns.append(range_btn)
     if _is_admin(uid):
         btns.append([KeyboardButton("⚙️ Admin Panel", style="primary")])
     return ReplyKeyboardMarkup(btns, resize_keyboard=True)
@@ -1105,7 +1110,7 @@ async def _update_2fa_countdown(message, code: str):
         remaining -= 1
 
 # ═══════════════════════════════════════════════════════════════
-#  CONVERSATION HANDLERS (added Range & Set Link)
+#  CONVERSATION HANDLERS (Range button now opens mini app directly)
 # ═══════════════════════════════════════════════════════════════
 MAIN_MENU, SITE_MENU, AWAIT_RANGE, ADMIN_MENU, SET_INTERVAL, ADMIN_SET_MENU, ADD_ADMIN_INPUT, \
 AWAIT_2FA_SECRET, SET_RATE, SET_WITHDRAW_RATE, \
@@ -1248,12 +1253,8 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👤 *Accounts Management*\nChoose an action:", parse_mode="Markdown", reply_markup=accounts_options_kb())
         return MAIN_MENU
     elif text == "📐 Range":
-        # Open mini app if link is set
-        if RANGE_LINK:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open Range Mini App", web_app=WebAppInfo(url=RANGE_LINK))]])
-            await update.message.reply_text("Click below to open the range mini app:", reply_markup=kb)
-        else:
-            await update.message.reply_text("❌ Range link not set by admin yet.")
+        # This only triggers when RANGE_LINK is not set (regular button sends text)
+        await update.message.reply_text("❌ Range link not set by admin yet.")
         return MAIN_MENU
     elif text == "⚙️ Admin Panel" and _is_admin(uid):
         await update.message.reply_text(
