@@ -744,7 +744,7 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
                     f"{bal_line}"
                 )
                 if COPY_SUPPORTED:
-                    user_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", copy_text=CopyTextButton(text=clean_otp))]])
+                    user_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", copy_text=CopyTextButton(text=clean_otp),style="success")]])
                 else:
                     user_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", callback_data=f"copy_otp_{clean_otp}", style="primary")]])
                 try: await app.bot.send_message(uid, user_text, parse_mode="Markdown", reply_markup=user_kb)
@@ -795,12 +795,12 @@ def admin_set_menu_kb() -> ReplyKeyboardMarkup:
     ], resize_keyboard=True)
 
 def number_ready_kb(number: str) -> InlineKeyboardMarkup:
-    row1 = [InlineKeyboardButton("👥 OTP Group", url=OTP_GROUP_LINK),
+    row1 = [InlineKeyboardButton("👥 OTP Group", url=OTP_GROUP_LINK ,style="success"),
             InlineKeyboardButton("🔄 Change Number", callback_data="change_number", style="danger")]
     if COPY_SUPPORTED:
-        row2 = [InlineKeyboardButton("📋 Copy Number", copy_text=CopyTextButton(text=f"+{number}"))]
+        row2 = [InlineKeyboardButton("📋 Copy Number", copy_text=CopyTextButton(text=f"+{number}"),style="success")]
     else:
-        row2 = [InlineKeyboardButton("📋 Copy Number", callback_data=f"copy_num_{number}", style="primary")]
+        row2 = [InlineKeyboardButton("📋 Copy Number", callback_data=f"copy_num_{number}", style="success")]
     return InlineKeyboardMarkup([row1, row2])
 
 def balance_inline_kb() -> InlineKeyboardMarkup:
@@ -906,24 +906,28 @@ async def cb_change_fake_details(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def _send_identity_message(message, identity: dict, edit: bool=False):
     emoji = "👨" if identity["gender"]=="male" else "👩"
     text = f"{emoji} *Generated Identity*\n\n👤 *Name:* `{identity['name']}`\n🆔 *Username:* `{identity['username']}`\n🔑 *Password:* `{identity['password']}`\n\n📅 Password ends with today's date."
+    
     if COPY_SUPPORTED:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Copy Name", copy_text=CopyTextButton(text=identity['name'])),
-             InlineKeyboardButton("📋 Copy User", copy_text=CopyTextButton(text=identity['username']))],
-            [InlineKeyboardButton("📋 Copy Pass", copy_text=CopyTextButton(text=identity['password']))],
-            [InlineKeyboardButton("🔄 Change Details", callback_data=f"change_fake_details_{identity['gender']}", style="primary")]
+            [InlineKeyboardButton("📋 Copy Name", copy_text=CopyTextButton(text=identity['name']), style="primary"),
+             InlineKeyboardButton("📋 Copy User", copy_text=CopyTextButton(text=identity['username']), style="primary")],
+            [InlineKeyboardButton("📋 Copy Pass", copy_text=CopyTextButton(text=identity['password']), style="success")],
+            [InlineKeyboardButton("🔄 Change Details", callback_data=f"change_fake_details_{identity['gender']}", style="danger")]
         ])
     else:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Copy Name", callback_data=f"copy_name_{identity['name']}", style="primary"),
              InlineKeyboardButton("📋 Copy User", callback_data=f"copy_username_{identity['username']}", style="primary")],
-            [InlineKeyboardButton("📋 Copy Pass", callback_data=f"copy_password_{identity['password']}", style="primary")],
-            [InlineKeyboardButton("🔄 Change Details", callback_data=f"change_fake_details_{identity['gender']}", style="primary")]
+            [InlineKeyboardButton("📋 Copy Pass", callback_data=f"copy_password_{identity['password']}", style="success")],
+            [InlineKeyboardButton("🔄 Change Details", callback_data=f"change_fake_details_{identity['gender']}", style="danger")]
         ])
+
     if edit:
-        try: await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        try:
+            await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
         except BadRequest as e:
-            if "message is not modified" not in str(e): raise
+            if "message is not modified" not in str(e):
+                raise
     else:
         await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
