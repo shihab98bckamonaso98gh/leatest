@@ -11,7 +11,7 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal 
 ✅ Number fetch retries (up to 3 attempts) to reduce "No number found"
 ✅ Better page/browser cleanup on errors
 ✅ Full error recovery – long‑time, stable operation
-✅ Fake OTP system for admin – manual/auto fake messages in OTP group
+✅ Fake OTP system – multiple saved countries per platform, inline selection, auto mode
 """
 
 import asyncio
@@ -28,7 +28,7 @@ import threading
 import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
-from typing import Optional, Dict, Set, Tuple
+from typing import Optional, Dict, Set, Tuple, List
 
 # ── load .env (optional) ─────────────────────────────────────
 try:
@@ -154,21 +154,30 @@ def save_min_withdraw(min_val: float):
 SMS_RATE_BDT = load_sms_rate()
 MIN_WITHDRAW_BDT = load_min_withdraw()
 
-# ── Fake OTP config ──────────────────────────────────────────
-def load_fake_otp_config() -> Dict:
+# ── Fake OTP config (list of dicts per platform) ────────────
+def load_fake_otp_config() -> Dict[str, List[Dict]]:
     if os.path.exists(FAKE_OTP_CONFIG_FILE):
         try:
             with open(FAKE_OTP_CONFIG_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                result = {"fb": [], "ig": []}
+                for k in ("fb", "ig"):
+                    val = data.get(k)
+                    if isinstance(val, list):
+                        result[k] = val
+                    elif isinstance(val, dict) and "country_name" in val:
+                        # migrate old single config to list
+                        result[k] = [val]
+                return result
         except:
             pass
-    return {"fb": {}, "ig": {}}
+    return {"fb": [], "ig": []}
 
-def save_fake_otp_config(config: Dict):
+def save_fake_otp_config(config: Dict[str, List[Dict]]):
     with open(FAKE_OTP_CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+        json.dump(config, f, indent=2, ensure_ascii=False)
 
-FAKE_OTP_CONFIG = load_fake_otp_config()   # mutable dict, updated in-place
+FAKE_OTP_CONFIG = load_fake_otp_config()
 
 # ── Database (Balance + Withdrawals + Stats + Credentials) ──────
 EXCHANGE_RATE = 125.0   # 1 USD = 125 BDT
@@ -898,26 +907,33 @@ def format_balance_message(user_id: int) -> str:
     return text
 
 # ═══════════════════════════════════════════════════════════════
-#  FAKE OTP HELPERS (updated with language mix and Get Number button)
+#  FAKE OTP HELPERS (updated with multiple configs and inline select)
 # ═══════════════════════════════════════════════════════════════
 def generate_random_otp(length: int = 6) -> str:
+    """Generate a random OTP of given length (e.g., 5 or 6)."""
     return ''.join(random.choices(string.digits, k=length))
 
 def generate_random_last3() -> str:
     return ''.join(random.choices(string.digits, k=3))
 
-def build_fake_otp_message(platform: str) -> Optional[str]:
+def build_fake_otp_message(platform: str, config_override: Optional[Dict] = None) -> Optional[str]:
     """
-    platform: 'fb5', 'fb6', or 'ig'
-    Returns message text or None if config missing.
+    Build a fake OTP message.
+    platform: 'fb5', 'fb6', 'ig'
+    config_override: {'country_name':..., 'country_code':...} if provided, else uses global list.
     """
     base_platform = "fb" if platform.startswith("fb") else "ig"
-    config = FAKE_OTP_CONFIG.get(base_platform)
-    if not config or not config.get("country_name") or not config.get("country_code"):
-        return None
+    if config_override:
+        country_name = config_override["country_name"]
+        country_code = config_override["country_code"]
+    else:
+        configs = FAKE_OTP_CONFIG.get(base_platform, [])
+        if not configs:
+            return None
+        cfg = configs[0]  # fallback; should never be called directly like this in new logic
+        country_name = cfg["country_name"]
+        country_code = cfg["country_code"]
 
-    country_name = config["country_name"]
-    country_code = config["country_code"]
     last3 = generate_random_last3()
     number_display = f"+{country_code}******{last3}"
 
@@ -952,7 +968,7 @@ def build_fake_otp_message(platform: str) -> Optional[str]:
     )
     return msg
 
-def get_number_button() -> InlineKeyboardMarkup:
+def get_number_button() -> Optional[InlineKeyboardMarkup]:
     """Inline button '🤖 Get Number' pointing to bot start."""
     if BOT_USERNAME:
         return InlineKeyboardMarkup([[
@@ -960,8 +976,8 @@ def get_number_button() -> InlineKeyboardMarkup:
         ]])
     return None
 
-async def send_fake_otp(app: Application, platform: str):
-    msg = build_fake_otp_message(platform)
+async def send_fake_otp(app: Application, platform: str, config_override: Optional[Dict] = None):
+    msg = build_fake_otp_message(platform, config_override)
     if msg is None:
         return False
     try:
@@ -976,26 +992,34 @@ async def auto_fake_loop(app: Application):
     global auto_fake_running
     while auto_fake_running:
         platform = random.choice(["fb5", "fb6", "ig"])
-        msg = build_fake_otp_message(platform)
-        if msg:
-            try:
-                kb = get_number_button()
-                await app.bot.send_message(chat_id=OTP_GROUP_ID, text=msg, reply_markup=kb)
-            except Exception as e:
-                log.error(f"Auto fake OTP error: {e}")
+        base = "fb" if platform.startswith("fb") else "ig"
+        configs = FAKE_OTP_CONFIG.get(base, [])
+        if configs:
+            cfg = random.choice(configs)
+            msg = build_fake_otp_message(platform, cfg)
+            if msg:
+                try:
+                    kb = get_number_button()
+                    await app.bot.send_message(chat_id=OTP_GROUP_ID, text=msg, reply_markup=kb)
+                except Exception as e:
+                    log.error(f"Auto fake OTP error: {e}")
         delay = random.uniform(1, 5)
         extra = random.choice([0, 1, 2])
         for _ in range(extra):
             if not auto_fake_running:
                 break
             platform2 = random.choice(["fb5", "fb6", "ig"])
-            msg2 = build_fake_otp_message(platform2)
-            if msg2:
-                try:
-                    kb = get_number_button()
-                    await app.bot.send_message(chat_id=OTP_GROUP_ID, text=msg2, reply_markup=kb)
-                except Exception as e:
-                    log.error(f"Auto fake burst error: {e}")
+            base2 = "fb" if platform2.startswith("fb") else "ig"
+            configs2 = FAKE_OTP_CONFIG.get(base2, [])
+            if configs2:
+                cfg2 = random.choice(configs2)
+                msg2 = build_fake_otp_message(platform2, cfg2)
+                if msg2:
+                    try:
+                        kb = get_number_button()
+                        await app.bot.send_message(chat_id=OTP_GROUP_ID, text=msg2, reply_markup=kb)
+                    except Exception as e:
+                        log.error(f"Auto fake burst error: {e}")
             await asyncio.sleep(0.2)
         await asyncio.sleep(delay)
 
@@ -1266,7 +1290,27 @@ async def _update_2fa_countdown(message, code: str):
         await asyncio.sleep(1)
         remaining -= 1
 
-# ── Fake OTP callback (set details) ─────────────────────────
+# ── Fake OTP inline selection callbacks ─────────────────────────
+async def cb_fake_send_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    data = query.data
+    # pattern: fake_send_fb5_0, fake_send_fb6_1, fake_send_ig_2
+    parts = data.split("_", 3)  # ['fake','send','fb5','0']
+    if len(parts)!=4 or parts[0]!="fake" or parts[1]!="send": return
+    platform = parts[2]  # fb5, fb6, ig
+    index = int(parts[3])
+    base = "fb" if platform.startswith("fb") else "ig"
+    configs = FAKE_OTP_CONFIG.get(base, [])
+    if 0 <= index < len(configs):
+        cfg = configs[index]
+        ok = await send_fake_otp(ctx.application, platform, cfg)
+        if ok:
+            await query.edit_message_text(f"✅ Sent {platform.upper()} OTP from {cfg['country_name']}.")
+        else:
+            await query.edit_message_text(f"❌ Failed to send {platform.upper()} OTP.")
+    else:
+        await query.answer("Invalid selection.", show_alert=True)
+
 async def cb_set_fake_details(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     platform = "fb" if "fb" in query.data else "ig"
@@ -1292,6 +1336,7 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _check_membership(update, ctx): return ConversationHandler.END
 
+    # ── guard against updates without a message text ──
     if not update.message or not update.message.text:
         return None
 
@@ -1495,49 +1540,38 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADMIN_MENU
     if ctx.user_data.get('awaiting_fake_country_code'):
         country_code = text.strip()
-        platform = ctx.user_data.get('fake_otp_platform')
+        platform = ctx.user_data.pop('fake_otp_platform')
         country_name = ctx.user_data.pop('fake_country_name')
         ctx.user_data.pop('awaiting_fake_country_code')
-        ctx.user_data.pop('fake_otp_platform')
-        FAKE_OTP_CONFIG[platform] = {
-            "country_name": country_name,
-            "country_code": country_code
-        }
+        FAKE_OTP_CONFIG.setdefault(platform, [])
+        FAKE_OTP_CONFIG[platform].append({"country_name": country_name, "country_code": country_code})
         save_fake_otp_config(FAKE_OTP_CONFIG)
-        await update.message.reply_text(f"✅ Fake OTP details for {platform.upper()} saved.", reply_markup=fake_otp_menu_kb())
+        await update.message.reply_text(f"✅ New fake OTP details for {platform.upper()} saved.", reply_markup=fake_otp_menu_kb())
         return ADMIN_MENU
 
     # ── Fake OTP menu commands ──
     if ctx.user_data.get('in_fake_otp_menu'):
-        if text == "FB Send 5":
-            if not FAKE_OTP_CONFIG.get("fb"):
-                await update.message.reply_text("❌ FB details not set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
+        if text in ("FB Send 5", "FB Send 6", "IG Send"):
+            base = "fb" if text.startswith("FB") else "ig"
+            configs = FAKE_OTP_CONFIG.get(base, [])
+            if not configs:
+                await update.message.reply_text("❌ No details set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
                 return ADMIN_MENU
-            await update.message.reply_text("📨 Sending fake FB 5‑digit OTP...")
-            ok = await send_fake_otp(ctx.application, "fb5")
-            await update.message.reply_text("✅ Sent." if ok else "❌ Failed to send.", reply_markup=fake_otp_menu_kb())
-            return ADMIN_MENU
-        elif text == "FB Send 6":
-            if not FAKE_OTP_CONFIG.get("fb"):
-                await update.message.reply_text("❌ FB details not set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
-                return ADMIN_MENU
-            await update.message.reply_text("📨 Sending fake FB 6‑digit OTP...")
-            ok = await send_fake_otp(ctx.application, "fb6")
-            await update.message.reply_text("✅ Sent." if ok else "❌ Failed to send.", reply_markup=fake_otp_menu_kb())
-            return ADMIN_MENU
-        elif text == "IG Send":
-            if not FAKE_OTP_CONFIG.get("ig"):
-                await update.message.reply_text("❌ IG details not set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
-                return ADMIN_MENU
-            await update.message.reply_text("📨 Sending fake IG OTP...")
-            ok = await send_fake_otp(ctx.application, "ig")
-            await update.message.reply_text("✅ Sent." if ok else "❌ Failed to send.", reply_markup=fake_otp_menu_kb())
+            platform_code = "fb5" if text == "FB Send 5" else ("fb6" if text == "FB Send 6" else "ig")
+            # build inline keyboard with config list
+            buttons = []
+            for idx, cfg in enumerate(configs):
+                label = f"{cfg['country_name']} (+{cfg['country_code']})"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"fake_send_{platform_code}_{idx}")])
+            kb = InlineKeyboardMarkup(buttons)
+            await update.message.reply_text("📋 Select a country configuration:", reply_markup=kb)
             return ADMIN_MENU
         elif text.startswith("Auto:"):
             if auto_fake_running:
                 stop_auto_fake()
                 await update.message.reply_text("⏹ Auto fake OTP stopped.", reply_markup=fake_otp_menu_kb())
             else:
+                # Check if at least one config exists
                 if not FAKE_OTP_CONFIG.get("fb") and not FAKE_OTP_CONFIG.get("ig"):
                     await update.message.reply_text("❌ Set at least one platform details first.", reply_markup=fake_otp_menu_kb())
                     return ADMIN_MENU
@@ -1618,7 +1652,7 @@ async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.copy(chat_id=user_id)
             success += 1
-        except Exception:
+        except Exception as e:
             pass
     await update.message.reply_text(f"✅ Broadcast sent to {success}/{len(all_users)} users.", reply_markup=admin_menu_kb(uid))
     return ADMIN_MENU
@@ -1833,6 +1867,8 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_login_site_selected, pattern="^login_site_"))
     app.add_handler(CallbackQueryHandler(cb_accounts_options, pattern="^accounts_login$|^accounts_logout$"))
     app.add_handler(CallbackQueryHandler(cb_logout_site_selected, pattern="^logout_site_"))
+    # Fake OTP callbacks
+    app.add_handler(CallbackQueryHandler(cb_fake_send_inline, pattern="^fake_send_"))
     app.add_handler(CallbackQueryHandler(cb_set_fake_details, pattern="^set_fake_details_"))
     app.add_error_handler(error_handler)
 
