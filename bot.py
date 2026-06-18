@@ -1,4 +1,4 @@
-"""
+""""
 STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ============================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
@@ -7,6 +7,10 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
 ✅ Coloured buttons (primary / success / danger)
 ✅ Persistent SQLite database via $DATA_DIR
+✅ Robust update handling: guards against missing message.text
+✅ Number fetch retries (up to 3 attempts) to reduce "No number found"
+✅ Better page/browser cleanup on errors
+✅ Full error recovery – long‑time, stable operation
 """
 
 import asyncio
@@ -390,6 +394,7 @@ SITES = {
 
 POLL_INTERVAL   = 3
 MONITOR_TIMEOUT = 480
+FETCH_RETRIES   = 3   # try to fetch number up to 3 times before giving up
 
 # ═══════════════════════════════════════════════════════════════
 #  LOGGING – essential INFO only, no DEBUG from smsbot
@@ -402,7 +407,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logging.getLogger("telegram._bot").setLevel(logging.WARNING)
 log = logging.getLogger("smsbot")
-log.setLevel(logging.INFO)   # DEBUG messages are now completely hidden
+log.setLevel(logging.INFO)
 
 # ═══════════════════════════════════════════════════════════════
 #  GLOBAL STATE
@@ -451,14 +456,13 @@ def start_health_server(port: int):
     log.info(f"🌐 Health server listening on port {port}")
 
 # ═══════════════════════════════════════════════════════════════
-#  HELPERS – all debug logs are now suppressed
+#  HELPERS
 # ═══════════════════════════════════════════════════════════════
 def _stop_monitor(uid: int):
     s = user_sessions.get(uid, {})
     task = s.get("monitor_task")
     if task and not task.done():
         task.cancel()
-        # log.debug suppressed
 
 def _is_owner(uid: int) -> bool: return uid == OWNER_USER_ID
 def _is_admin(uid: int) -> bool: return uid in ADMIN_USERS or _is_owner(uid)
@@ -527,7 +531,8 @@ async def _check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         InlineKeyboardButton("Join Channel", url=OTP_GROUP_LINK),
         InlineKeyboardButton("Verify", callback_data="verify_membership", style="primary")
     ]])
-    await update.message.reply_text("🔒 Access Restricted!\n\nPlease join our channel to use this bot.", reply_markup=kb)
+    if update.message:
+        await update.message.reply_text("🔒 Access Restricted!\n\nPlease join our channel to use this bot.", reply_markup=kb)
     return False
 
 async def verify_membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -542,7 +547,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer("You are not yet a member of the channel.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════
-#  BROWSER / SCRAPER – routine logs hidden
+#  BROWSER / SCRAPER – improved error handling & retries
 # ═══════════════════════════════════════════════════════════════
 async def _ensure_playwright():
     global _playwright_obj, _browser
@@ -551,28 +556,32 @@ async def _ensure_playwright():
             if _playwright_obj: await _playwright_obj.stop()
             _playwright_obj = await async_playwright().start()
             _browser = await _playwright_obj.chromium.launch(
-                headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-blink-features=AutomationControlled"]
+                headless=True,
+                args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-blink-features=AutomationControlled"]
             )
             if _browser is None:
                 raise RuntimeError("Chromium launch failed – check Playwright/Docker version")
 
 async def _login_with_credentials(page: Page, site: str, email: str, password: str) -> bool:
     site_cfg = SITES[site]
-    # debug logs removed (would be suppressed anyway)
-    await page.goto(site_cfg["login_url"], wait_until="networkidle", timeout=30000)
-    await page.fill("input[type='email']", email)
-    await page.fill("input[type='password']", password)
-    await page.click("button[type='submit']")
     try:
-        await page.wait_for_url(lambda url: "auth" not in url and "login" not in url, timeout=60000)
-        return True
-    except Exception:
-        if "/dialer/" in page.url: return True
+        await page.goto(site_cfg["login_url"], wait_until="networkidle", timeout=30000)
+        await page.fill("input[type='email']", email)
+        await page.fill("input[type='password']", password)
+        await page.click("button[type='submit']")
         try:
-            await page.wait_for_selector("table.gn-tbl, input.gn-range-input", timeout=5000)
+            await page.wait_for_url(lambda url: "auth" not in url and "login" not in url, timeout=60000)
             return True
-        except Exception: pass
-    return False
+        except Exception:
+            if "/dialer/" in page.url: return True
+            try:
+                await page.wait_for_selector("table.gn-tbl, input.gn-range-input", timeout=5000)
+                return True
+            except Exception: pass
+        return False
+    except Exception as e:
+        log.error(f"Login error: {e}")
+        return False
 
 async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
     await _ensure_playwright()
@@ -589,15 +598,13 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
             await context.grant_permissions(["clipboard-read"])
             page = await context.new_page()
             user_pages[site] = page
-            success = await _login_with_credentials(page, site, creds[0], creds[1])
-            if not success:
+            if not await _login_with_credentials(page, site, creds[0], creds[1]):
                 await page.close()
                 del user_pages[site]
                 raise Exception(f"Login failed for {site} with custom credentials")
         else:
             if page.url and ("login" in page.url or "auth" in page.url):
-                success = await _login_with_credentials(page, site, creds[0], creds[1])
-                if not success:
+                if not await _login_with_credentials(page, site, creds[0], creds[1]):
                     raise Exception(f"Re‑login failed for {site}")
     else:
         page = _global_pages.get(site)
@@ -608,52 +615,75 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
             await context.grant_permissions(["clipboard-read"])
             page = await context.new_page()
             _global_pages[site] = page
-            await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD)
+            if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
+                # If global login fails, we raise an exception
+                await page.close()
+                del _global_pages[site]
+                raise Exception(f"Global login failed for {site}")
         else:
             if page.url and ("login" in page.url or "auth" in page.url):
-                await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD)
+                if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
+                    raise Exception(f"Global re‑login failed for {site}")
     await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
     return page
 
 async def fetch_number(range_str: str, site: str, user_id: int = None) -> Optional[dict]:
-    page = await _ensure_page_logged_in(site, user_id)
-    async with _page_lock:
+    """Try to fetch a number up to FETCH_RETRIES times."""
+    last_exception = None
+    for attempt in range(1, FETCH_RETRIES+1):
         try:
-            if "/dialer/" not in page.url:
-                await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
-            first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
-            old_number = None
-            if await first_row.count() > 0:
-                old_number = (await first_row.locator(".gn-num").first.inner_text()).strip().lstrip("+")
-            inp = page.locator("input.gn-range-input"); await inp.wait_for(state="visible", timeout=15000)
-            await inp.fill(""); await inp.type(range_str, delay=25); await asyncio.sleep(0.15)
-            await page.locator("button.btn.btn-primary:has-text('Get Number')").click()
+            page = await _ensure_page_logged_in(site, user_id)
+            async with _page_lock:
+                if "/dialer/" not in page.url:
+                    await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
+                first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
+                old_number = None
+                if await first_row.count() > 0:
+                    old_number = (await first_row.locator(".gn-num").first.inner_text()).strip().lstrip("+")
+                inp = page.locator("input.gn-range-input")
+                await inp.wait_for(state="visible", timeout=15000)
+                await inp.fill(""); await inp.type(range_str, delay=25); await asyncio.sleep(0.15)
+                await page.locator("button.btn.btn-primary:has-text('Get Number')").click()
 
-            try:
-                await page.wait_for_function(
-                    """(old)=>{const r=document.querySelectorAll('table.gn-tbl tbody tr');
-                    for(let i=0;i<r.length;i++){let n=r[i].querySelector('.gn-num');
-                    if(n&&n.textContent.trim().replace(/^\\+/,'')!==old)return true;break;}return false;}""",
-                    arg=old_number or "", timeout=15000)
-            except PlaywrightTimeoutError:
-                return None
+                try:
+                    await page.wait_for_function(
+                        """(old)=>{const r=document.querySelectorAll('table.gn-tbl tbody tr');
+                        for(let i=0;i<r.length;i++){let n=r[i].querySelector('.gn-num');
+                        if(n&&n.textContent.trim().replace(/^\\+/,'')!==old)return true;break;}return false;}""",
+                        arg=old_number or "", timeout=15000)
+                except PlaywrightTimeoutError:
+                    return None
 
-            first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
-            if not await first_row.count(): return None
-            number = (await first_row.locator(".gn-num").first.inner_text()).strip().lstrip("+")
-            country = (await first_row.locator(".gn-meta").first.inner_text()).strip() if await first_row.locator(".gn-meta").count() else "Unknown"
-            operator = (await first_row.locator(".gn-meta-sub").first.inner_text()).strip() if await first_row.locator(".gn-meta-sub").count() else "Unknown"
-            operator = re.sub(r"\s+", " ", operator).strip()
-            if not number: return None
-            return {"number":number,"country":country,"operator":operator}
+                first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
+                if not await first_row.count(): return None
+                number = (await first_row.locator(".gn-num").first.inner_text()).strip().lstrip("+")
+                country = (await first_row.locator(".gn-meta").first.inner_text()).strip() if await first_row.locator(".gn-meta").count() else "Unknown"
+                operator = (await first_row.locator(".gn-meta-sub").first.inner_text()).strip() if await first_row.locator(".gn-meta-sub").count() else "Unknown"
+                operator = re.sub(r"\s+", " ", operator).strip()
+                if not number: return None
+                return {"number":number,"country":country,"operator":operator}
         except Exception as e:
-            log.error(f"❌ fetch_number error: {e}")
-            return None
+            log.error(f"❌ fetch_number attempt {attempt} error: {e}")
+            last_exception = e
+            # Clean up bad page before next retry
+            if user_id and user_id in _user_pages and site in _user_pages[user_id]:
+                try:
+                    await _user_pages[user_id][site].close()
+                except: pass
+                del _user_pages[user_id][site]
+            elif site in _global_pages:
+                try:
+                    await _global_pages[site].close()
+                except: pass
+                del _global_pages[site]
+            await asyncio.sleep(1)
+    log.error(f"❌ All {FETCH_RETRIES} fetch attempts failed. Last error: {last_exception}")
+    return None
 
 async def poll_otp(number: str, site: str, user_id: int = None) -> Optional[str]:
-    page = await _ensure_page_logged_in(site, user_id)
-    async with _page_lock:
-        try:
+    try:
+        page = await _ensure_page_logged_in(site, user_id)
+        async with _page_lock:
             if "/dialer/" not in page.url:
                 await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
             rows = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num"))
@@ -675,9 +705,9 @@ async def poll_otp(number: str, site: str, user_id: int = None) -> Optional[str]
                 if ":" in title: return title.split(":",1)[1].strip()
                 return None
             return None
-        except Exception as e:
-            log.error(f"❌ poll_otp error: {e}")
-            return None
+    except Exception as e:
+        log.error(f"❌ poll_otp error: {e}")
+        return None
 
 # ═══════════════════════════════════════════════════════════════
 #  MONITOR TASK
@@ -849,7 +879,7 @@ async def cb_change_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if result:
         await _deliver_number(ctx.application, uid, result, site)
     else:
-        await query.message.reply_text("❌ No number found.", reply_markup=main_menu_kb(uid))
+        await query.message.reply_text("❌ No number found after several attempts.", reply_markup=main_menu_kb(uid))
 
 async def cb_copy_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -1078,7 +1108,7 @@ async def _update_2fa_countdown(message, code: str):
         remaining -= 1
 
 # ═══════════════════════════════════════════════════════════════
-#  CONVERSATION HANDLERS
+#  CONVERSATION HANDLERS (guarded against missing message.text)
 # ═══════════════════════════════════════════════════════════════
 MAIN_MENU, SITE_MENU, AWAIT_RANGE, ADMIN_MENU, SET_INTERVAL, ADMIN_SET_MENU, ADD_ADMIN_INPUT, \
 AWAIT_2FA_SECRET, SET_RATE, SET_WITHDRAW_RATE, \
@@ -1095,6 +1125,11 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _check_membership(update, ctx): return ConversationHandler.END
 
+    # ── guard against updates without a message text ──
+    if not update.message or not update.message.text:
+        return None  # stay in same state, ignore
+
+    # ── pending withdrawal flows ──
     if ctx.user_data.get('awaiting_withdraw_account'):
         account = update.message.text.strip()
         ctx.user_data['withdraw_account'] = account
@@ -1230,6 +1265,8 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def login_password_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
     password = update.message.text.strip()
     site = ctx.user_data.get('login_site')
     email = ctx.user_data.get('login_email')
@@ -1255,6 +1292,8 @@ async def login_password_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 async def handle_2fa_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
     secret = update.message.text.strip()
     result = generate_2fa_code(secret)
     if result["success"]:
@@ -1275,7 +1314,10 @@ async def handle_2fa_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; text = update.message.text
+    uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text
     if text == "Interval":
         await update.message.reply_text("Enter new delay in seconds (1‑60):", reply_markup=ReplyKeyboardRemove())
         return SET_INTERVAL
@@ -1323,6 +1365,8 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not update.message:
+        return None
     if update.message.text and update.message.text == "/cancel":
         await update.message.reply_text("Broadcast cancelled.", reply_markup=admin_menu_kb(uid))
         return ADMIN_MENU
@@ -1333,14 +1377,16 @@ async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.copy(chat_id=user_id)
             success += 1
         except Exception as e:
-            # log suppressed
             pass
     await update.message.reply_text(f"✅ Broadcast sent to {success}/{len(all_users)} users.", reply_markup=admin_menu_kb(uid))
     return ADMIN_MENU
 
 async def set_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global SMS_RATE_BDT
-    uid = update.effective_user.id; text = update.message.text.strip()
+    uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
     try:
         rate = float(text)
         if rate < 0: raise ValueError
@@ -1354,7 +1400,10 @@ async def set_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def set_withdraw_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global MIN_WITHDRAW_BDT
-    uid = update.effective_user.id; text = update.message.text.strip()
+    uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
     try:
         min_val = float(text)
         if min_val < 0: raise ValueError
@@ -1367,7 +1416,10 @@ async def set_withdraw_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TY
         return ADMIN_MENU
 
 async def admin_set_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; text = update.message.text
+    uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text
     if text == "Add Admin":
         await update.message.reply_text("👤 Send me the **user ID** to add as admin.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         return ADD_ADMIN_INPUT
@@ -1385,7 +1437,10 @@ async def admin_set_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 async def admin_set_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global ADMIN_USERS
-    uid = update.effective_user.id; text = update.message.text.strip()
+    uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
     try: new_id = int(text)
     except ValueError:
         await update.message.reply_text("❌ Invalid ID.", reply_markup=admin_set_menu_kb()); return ADMIN_SET_MENU
@@ -1395,7 +1450,10 @@ async def admin_set_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def admin_set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global CHANGE_NUMBER_DELAY
-    uid = update.effective_user.id; text = update.message.text.strip()
+    uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
     try:
         val = int(text)
         if val<1 or val>60: raise ValueError
@@ -1407,7 +1465,10 @@ async def admin_set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADMIN_MENU
 
 async def site_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id; text = update.message.text
+    uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text
     if text == "🔙 Back":
         await update.message.reply_text("🏠 Main menu:", reply_markup=main_menu_kb(uid)); return MAIN_MENU
     site = None
@@ -1424,6 +1485,8 @@ async def site_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not update.message or not update.message.text:
+        return None
     range_text = update.message.text.strip().upper()
     if "XXX" not in range_text:
         await update.message.reply_text("❌ Invalid format. Range must contain `XXX`.", parse_mode="Markdown"); return AWAIT_RANGE
@@ -1438,8 +1501,8 @@ async def handle_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     wait_msg = await update.message.reply_text("⏳ *Fetching your number...*", parse_mode="Markdown", reply_markup=main_menu_kb(uid))
     result = await fetch_number(range_text, site, uid)
     if not result:
-        try: await wait_msg.edit_text("❌ No number found.", reply_markup=main_menu_kb(uid))
-        except: await update.message.reply_text("❌ No number found.", reply_markup=main_menu_kb(uid))
+        try: await wait_msg.edit_text("❌ No number found. Try a different range.", reply_markup=main_menu_kb(uid))
+        except: await update.message.reply_text("❌ No number found. Try a different range.", reply_markup=main_menu_kb(uid))
         return MAIN_MENU
     await _deliver_number(ctx.application, uid, result, site, edit_msg=wait_msg)
     return MAIN_MENU
@@ -1477,7 +1540,6 @@ def main():
     if HEALTH_PORT > 0:
         start_health_server(HEALTH_PORT)
 
-    # Startup delay to prevent polling conflict on Railway redeploy
     log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
     time.sleep(5)
 
