@@ -1,6 +1,6 @@
-""""
-STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
-============================================================================
+"""
+STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal + Fake OTP)
+========================================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
 ✅ Silent mode: only essential startup logs are shown (DB, health, delay, bot running)
 ✅ All other operational logs suppressed (logger level set to INFO)
@@ -11,6 +11,7 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal)
 ✅ Number fetch retries (up to 3 attempts) to reduce "No number found"
 ✅ Better page/browser cleanup on errors
 ✅ Full error recovery – long‑time, stable operation
+✅ Fake OTP system for admin – manual/auto fake messages in OTP group
 """
 
 import asyncio
@@ -100,6 +101,7 @@ DB_FILE = os.path.join(DATA_DIR, "bot_data.db")
 RATE_CONFIG_FILE = os.path.join(DATA_DIR, "rate_config.json")
 WITHDRAW_CONFIG_FILE = os.path.join(DATA_DIR, "withdraw_config.json")
 ADMIN_USERS_FILE = os.path.join(DATA_DIR, "admin_users.json")
+FAKE_OTP_CONFIG_FILE = os.path.join(DATA_DIR, "fake_otp_config.json")
 
 def _load_admins() -> Set[int]:
     s = set()
@@ -151,6 +153,22 @@ def save_min_withdraw(min_val: float):
 
 SMS_RATE_BDT = load_sms_rate()
 MIN_WITHDRAW_BDT = load_min_withdraw()
+
+# ── Fake OTP config ──────────────────────────────────────────
+def load_fake_otp_config() -> Dict:
+    if os.path.exists(FAKE_OTP_CONFIG_FILE):
+        try:
+            with open(FAKE_OTP_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {"fb": {}, "ig": {}}
+
+def save_fake_otp_config(config: Dict):
+    with open(FAKE_OTP_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+FAKE_OTP_CONFIG = load_fake_otp_config()   # mutable dict, updated in-place
 
 # ── Database (Balance + Withdrawals + Stats + Credentials) ──────
 EXCHANGE_RATE = 125.0   # 1 USD = 125 BDT
@@ -438,6 +456,11 @@ LAST_NAMES   = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","
                 "Hill","Flores","Green","Adams","Nelson","Baker","Hall","Rivera","Campbell","Mitchell",
                 "Carter","Roberts"]
 
+# ── Fake OTP globals ─────────────────────────────────────────
+auto_fake_running = False
+auto_fake_task: Optional[asyncio.Task] = None
+BOT_USERNAME: Optional[str] = None  # will be set in main()
+
 # ═══════════════════════════════════════════════════════════════
 #  HEALTH‑CHECK HTTP SERVER (for Railway)
 # ═══════════════════════════════════════════════════════════════
@@ -616,7 +639,6 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
             page = await context.new_page()
             _global_pages[site] = page
             if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
-                # If global login fails, we raise an exception
                 await page.close()
                 del _global_pages[site]
                 raise Exception(f"Global login failed for {site}")
@@ -781,7 +803,8 @@ def admin_menu_kb(uid: int) -> ReplyKeyboardMarkup:
         [KeyboardButton("Interval", style="primary")],
         [KeyboardButton("Set SMS Rate", style="success"), KeyboardButton("Set Withdraw Rate", style="primary")],
         [KeyboardButton("Pending", style="primary"), KeyboardButton("Approved", style="success")],
-        [KeyboardButton("Users Status", style="success"), KeyboardButton("Broadcast", style="primary")]
+        [KeyboardButton("Users Status", style="success"), KeyboardButton("Broadcast", style="primary")],
+        [KeyboardButton("📨 Fake OTP", style="danger")]
     ]
     if _is_owner(uid):
         btns.append([KeyboardButton("Admin Set", style="primary")])
@@ -842,6 +865,22 @@ def logout_site_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("VoltxSMS", callback_data="logout_site_voltxsms", style="danger")]
     ])
 
+def fake_otp_menu_kb() -> ReplyKeyboardMarkup:
+    auto_label = "Auto: ON" if auto_fake_running else "Auto: OFF"
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("FB Send 5", style="primary"), KeyboardButton("FB Send 6", style="primary")],
+        [KeyboardButton("IG Send", style="primary")],
+        [KeyboardButton(auto_label, style="success")],
+        [KeyboardButton("Set Details", style="success")],
+        [KeyboardButton("🔙 Back", style="danger")]
+    ], resize_keyboard=True)
+
+def fake_details_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Facebook", callback_data="set_fake_details_fb", style="primary"),
+         InlineKeyboardButton("Instagram", callback_data="set_fake_details_ig", style="primary")]
+    ])
+
 # ── Format balance message ────────────────────────────────────
 def format_balance_message(user_id: int) -> str:
     balance = get_user_balance(user_id)
@@ -857,6 +896,122 @@ def format_balance_message(user_id: int) -> str:
         f"💳 Minimum Withdrawal: {min_wd:.1f} BDT / ${min_wd/EXCHANGE_RATE:.2f}"
     )
     return text
+
+# ═══════════════════════════════════════════════════════════════
+#  FAKE OTP HELPERS (updated with language mix and Get Number button)
+# ═══════════════════════════════════════════════════════════════
+def generate_random_otp(length: int = 6) -> str:
+    return ''.join(random.choices(string.digits, k=length))
+
+def generate_random_last3() -> str:
+    return ''.join(random.choices(string.digits, k=3))
+
+def build_fake_otp_message(platform: str) -> Optional[str]:
+    """
+    platform: 'fb5', 'fb6', or 'ig'
+    Returns message text or None if config missing.
+    """
+    base_platform = "fb" if platform.startswith("fb") else "ig"
+    config = FAKE_OTP_CONFIG.get(base_platform)
+    if not config or not config.get("country_name") or not config.get("country_code"):
+        return None
+
+    country_name = config["country_name"]
+    country_code = config["country_code"]
+    last3 = generate_random_last3()
+    number_display = f"+{country_code}******{last3}"
+
+    if platform == "fb5":
+        otp = generate_random_otp(5)
+        # English by default, Hindi 5% of the time
+        if random.random() < 0.05:
+            body = f"<#> {otp} आपका Facebook कोड है H29Q+Fsn4Sr"
+        else:
+            body = f"<#> {otp} is your Facebook code H29Q+Fsn4Sr"
+        otp_display = otp
+    elif platform == "fb6":
+        otp = generate_random_otp(6)
+        if random.random() < 0.05:
+            body = f"<#> {otp} आपका Facebook कोड है H29Q+Fsn4Sr"
+        else:
+            body = f"<#> {otp} is your Facebook code H29Q+Fsn4Sr"
+        otp_display = otp
+    else:  # ig
+        otp = generate_random_otp(6)
+        suffix = random.choice(["GdDGcwrWHVm", "SIYRxKrru1t"])
+        body = f"<#> {otp[:3]} {otp[3:]} is your Instagram code. Don't share it. {suffix}"
+        otp_display = otp  # raw, no space
+
+    msg = (
+        f"📨 {country_name} OTP Received\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"📞 Number: {number_display}\n"
+        f"🔑 OTP: {otp_display}\n\n"
+        f"💬 {body}\n"
+        f"━━━━━━━━━━━━━━━━"
+    )
+    return msg
+
+def get_number_button() -> InlineKeyboardMarkup:
+    """Inline button '🤖 Get Number' pointing to bot start."""
+    if BOT_USERNAME:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("🤖 Get Number", url=f"https://t.me/{BOT_USERNAME}?start=start")
+        ]])
+    return None
+
+async def send_fake_otp(app: Application, platform: str):
+    msg = build_fake_otp_message(platform)
+    if msg is None:
+        return False
+    try:
+        kb = get_number_button()
+        await app.bot.send_message(chat_id=OTP_GROUP_ID, text=msg, reply_markup=kb)
+        return True
+    except Exception as e:
+        log.error(f"Failed to send fake OTP ({platform}): {e}")
+        return False
+
+async def auto_fake_loop(app: Application):
+    global auto_fake_running
+    while auto_fake_running:
+        platform = random.choice(["fb5", "fb6", "ig"])
+        msg = build_fake_otp_message(platform)
+        if msg:
+            try:
+                kb = get_number_button()
+                await app.bot.send_message(chat_id=OTP_GROUP_ID, text=msg, reply_markup=kb)
+            except Exception as e:
+                log.error(f"Auto fake OTP error: {e}")
+        delay = random.uniform(1, 5)
+        extra = random.choice([0, 1, 2])
+        for _ in range(extra):
+            if not auto_fake_running:
+                break
+            platform2 = random.choice(["fb5", "fb6", "ig"])
+            msg2 = build_fake_otp_message(platform2)
+            if msg2:
+                try:
+                    kb = get_number_button()
+                    await app.bot.send_message(chat_id=OTP_GROUP_ID, text=msg2, reply_markup=kb)
+                except Exception as e:
+                    log.error(f"Auto fake burst error: {e}")
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(delay)
+
+def start_auto_fake(app: Application):
+    global auto_fake_running, auto_fake_task
+    if auto_fake_running:
+        return
+    auto_fake_running = True
+    auto_fake_task = asyncio.create_task(auto_fake_loop(app))
+
+def stop_auto_fake():
+    global auto_fake_running, auto_fake_task
+    auto_fake_running = False
+    if auto_fake_task and not auto_fake_task.done():
+        auto_fake_task.cancel()
+    auto_fake_task = None
 
 # ═══════════════════════════════════════════════════════════════
 #  CALLBACKS
@@ -1111,6 +1266,14 @@ async def _update_2fa_countdown(message, code: str):
         await asyncio.sleep(1)
         remaining -= 1
 
+# ── Fake OTP callback (set details) ─────────────────────────
+async def cb_set_fake_details(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    platform = "fb" if "fb" in query.data else "ig"
+    ctx.user_data['fake_otp_platform'] = platform
+    ctx.user_data['awaiting_fake_country_name'] = True
+    await query.message.reply_text(f"🌍 Enter the *country name* for {platform.upper()} fake OTP (e.g., Guinea):", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+
 # ═══════════════════════════════════════════════════════════════
 #  CONVERSATION HANDLERS (guarded against missing message.text)
 # ═══════════════════════════════════════════════════════════════
@@ -1129,9 +1292,8 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _check_membership(update, ctx): return ConversationHandler.END
 
-    # ── guard against updates without a message text ──
     if not update.message or not update.message.text:
-        return None  # stay in same state, ignore
+        return None
 
     # ── pending withdrawal flows ──
     if ctx.user_data.get('awaiting_withdraw_account'):
@@ -1321,8 +1483,84 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not update.message or not update.message.text:
         return None
-    text = update.message.text
-    if text == "Interval":
+    text = update.message.text.strip()
+
+    # ── Fake OTP flows (set details) ──
+    if ctx.user_data.get('awaiting_fake_country_name'):
+        country_name = text
+        ctx.user_data['fake_country_name'] = country_name
+        ctx.user_data['awaiting_fake_country_name'] = False
+        ctx.user_data['awaiting_fake_country_code'] = True
+        await update.message.reply_text("📞 Now enter the *country code* (e.g., 224):", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        return ADMIN_MENU
+    if ctx.user_data.get('awaiting_fake_country_code'):
+        country_code = text.strip()
+        platform = ctx.user_data.get('fake_otp_platform')
+        country_name = ctx.user_data.pop('fake_country_name')
+        ctx.user_data.pop('awaiting_fake_country_code')
+        ctx.user_data.pop('fake_otp_platform')
+        FAKE_OTP_CONFIG[platform] = {
+            "country_name": country_name,
+            "country_code": country_code
+        }
+        save_fake_otp_config(FAKE_OTP_CONFIG)
+        await update.message.reply_text(f"✅ Fake OTP details for {platform.upper()} saved.", reply_markup=fake_otp_menu_kb())
+        return ADMIN_MENU
+
+    # ── Fake OTP menu commands ──
+    if ctx.user_data.get('in_fake_otp_menu'):
+        if text == "FB Send 5":
+            if not FAKE_OTP_CONFIG.get("fb"):
+                await update.message.reply_text("❌ FB details not set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
+                return ADMIN_MENU
+            await update.message.reply_text("📨 Sending fake FB 5‑digit OTP...")
+            ok = await send_fake_otp(ctx.application, "fb5")
+            await update.message.reply_text("✅ Sent." if ok else "❌ Failed to send.", reply_markup=fake_otp_menu_kb())
+            return ADMIN_MENU
+        elif text == "FB Send 6":
+            if not FAKE_OTP_CONFIG.get("fb"):
+                await update.message.reply_text("❌ FB details not set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
+                return ADMIN_MENU
+            await update.message.reply_text("📨 Sending fake FB 6‑digit OTP...")
+            ok = await send_fake_otp(ctx.application, "fb6")
+            await update.message.reply_text("✅ Sent." if ok else "❌ Failed to send.", reply_markup=fake_otp_menu_kb())
+            return ADMIN_MENU
+        elif text == "IG Send":
+            if not FAKE_OTP_CONFIG.get("ig"):
+                await update.message.reply_text("❌ IG details not set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
+                return ADMIN_MENU
+            await update.message.reply_text("📨 Sending fake IG OTP...")
+            ok = await send_fake_otp(ctx.application, "ig")
+            await update.message.reply_text("✅ Sent." if ok else "❌ Failed to send.", reply_markup=fake_otp_menu_kb())
+            return ADMIN_MENU
+        elif text.startswith("Auto:"):
+            if auto_fake_running:
+                stop_auto_fake()
+                await update.message.reply_text("⏹ Auto fake OTP stopped.", reply_markup=fake_otp_menu_kb())
+            else:
+                if not FAKE_OTP_CONFIG.get("fb") and not FAKE_OTP_CONFIG.get("ig"):
+                    await update.message.reply_text("❌ Set at least one platform details first.", reply_markup=fake_otp_menu_kb())
+                    return ADMIN_MENU
+                start_auto_fake(ctx.application)
+                await update.message.reply_text("▶ Auto fake OTP started.", reply_markup=fake_otp_menu_kb())
+            return ADMIN_MENU
+        elif text == "Set Details":
+            await update.message.reply_text("📋 *Select platform to configure:*", parse_mode="Markdown", reply_markup=fake_details_kb())
+            return ADMIN_MENU
+        elif text == "🔙 Back":
+            ctx.user_data.pop('in_fake_otp_menu', None)
+            await update.message.reply_text("⚙️ *Admin Panel*", parse_mode="Markdown", reply_markup=admin_menu_kb(uid))
+            return ADMIN_MENU
+        else:
+            await update.message.reply_text("❓ Unknown command.", reply_markup=fake_otp_menu_kb())
+            return ADMIN_MENU
+
+    # ── Regular admin menu ──
+    if text == "📨 Fake OTP":
+        ctx.user_data['in_fake_otp_menu'] = True
+        await update.message.reply_text("📨 *Fake OTP Controls*", parse_mode="Markdown", reply_markup=fake_otp_menu_kb())
+        return ADMIN_MENU
+    elif text == "Interval":
         await update.message.reply_text("Enter new delay in seconds (1‑60):", reply_markup=ReplyKeyboardRemove())
         return SET_INTERVAL
     elif text == "Set SMS Rate":
@@ -1380,7 +1618,7 @@ async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.copy(chat_id=user_id)
             success += 1
-        except Exception as e:
+        except Exception:
             pass
     await update.message.reply_text(f"✅ Broadcast sent to {success}/{len(all_users)} users.", reply_markup=admin_menu_kb(uid))
     return ADMIN_MENU
@@ -1533,9 +1771,10 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception:", exc_info=ctx.error)
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN (with early token check and startup delay)
+#  MAIN (with early bot username retrieval)
 # ═══════════════════════════════════════════════════════════════
 def main():
+    global BOT_USERNAME
     if not BOT_TOKEN:
         log.critical("❌ BOT_TOKEN is not set. Please set it in your Railway environment variables.")
         sys.exit(1)
@@ -1549,6 +1788,16 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
+    # Retrieve bot username once
+    async def get_username():
+        bot_user = await app.bot.get_me()
+        return bot_user.username
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    BOT_USERNAME = loop.run_until_complete(get_username())
+    log.info(f"🤖 Bot username: @{BOT_USERNAME}")
+
+    # Build handlers
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -1584,13 +1833,12 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_login_site_selected, pattern="^login_site_"))
     app.add_handler(CallbackQueryHandler(cb_accounts_options, pattern="^accounts_login$|^accounts_logout$"))
     app.add_handler(CallbackQueryHandler(cb_logout_site_selected, pattern="^logout_site_"))
+    app.add_handler(CallbackQueryHandler(cb_set_fake_details, pattern="^set_fake_details_"))
     app.add_error_handler(error_handler)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
     async def shutdown():
         log.info("🛑 Shutting down bot...")
+        stop_auto_fake()
         await app.stop()
         await app.shutdown()
         async with _browser_lock:
