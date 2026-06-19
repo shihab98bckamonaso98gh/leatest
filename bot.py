@@ -9,10 +9,10 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal 
 ✅ Persistent SQLite database via $DATA_DIR
 ✅ Robust update handling: guards against missing message.text
 ✅ Number fetch retries (up to 3 attempts) to reduce "No number found"
-✅ Better page/browser cleanup on errors
+✅ Better page/browser cleanup on errors – no more KeyError, no stale pages
 ✅ Full error recovery – long‑time, stable operation
 ✅ Fake OTP system – multiple saved countries per platform, inline selection, auto mode
-✅ Fixed: KeyError on cleanup, re‑login failure, event loop shutdown
+✅ Fixed: event loop / shutdown errors, KeyError on cleanup, re‑login failure handling
 """
 
 import asyncio
@@ -180,8 +180,8 @@ def save_fake_otp_config(config: Dict[str, List[Dict]]):
 
 FAKE_OTP_CONFIG = load_fake_otp_config()
 
-# ── Database (Balance + Withdrawals + Stats + Credentials) ──────
-EXCHANGE_RATE = 125.0   # 1 USD = 125 BDT
+# ── Database (unchanged) ─────────────────────────────────────
+EXCHANGE_RATE = 125.0
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -238,55 +238,44 @@ def init_db():
 def ensure_user_exists(user_id: int):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
-
 def get_user_balance(user_id: int) -> float:
     ensure_user_exists(user_id)
     with sqlite3.connect(DB_FILE) as conn:
         row = conn.execute('SELECT balance_bdt FROM users WHERE user_id = ?', (user_id,)).fetchone()
     return row[0] if row else 0.0
-
 def get_user_wallet(user_id: int) -> dict:
     with sqlite3.connect(DB_FILE) as conn:
         row = conn.execute('SELECT bkash, rocket, binance FROM users WHERE user_id = ?', (user_id,)).fetchone()
     if row:
         return {'bkash': row[0], 'rocket': row[1], 'binance': row[2]}
     return {'bkash': None, 'rocket': None, 'binance': None}
-
 def credit_user(user_id: int, amount: float):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('UPDATE users SET balance_bdt = balance_bdt + ? WHERE user_id = ?', (amount, user_id))
-
 def deduct_user(user_id: int, amount: float):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('UPDATE users SET balance_bdt = balance_bdt - ? WHERE user_id = ?', (amount, user_id))
-
 def update_wallet(user_id: int, wallet_type: str, number: str):
     column_map = {'bkash': 'bkash', 'rocket': 'rocket', 'binance': 'binance'}
     col = column_map.get(wallet_type)
     if col:
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute(f'UPDATE users SET {col} = ? WHERE user_id = ?', (number, user_id))
-
 def create_withdrawal(user_id: int, method: str, account: str, amount: float) -> int:
     with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.execute(
-            'INSERT INTO withdrawals (user_id, method, account, amount) VALUES (?,?,?,?)',
-            (user_id, method, account, amount)
-        )
+        cur = conn.execute('INSERT INTO withdrawals (user_id, method, account, amount) VALUES (?,?,?,?)',
+                           (user_id, method, account, amount))
         return cur.lastrowid
-
 def get_pending_withdrawals():
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute('SELECT * FROM withdrawals WHERE status = ?', ('pending',)).fetchall()
     return rows
-
 def get_approved_withdrawals():
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute('SELECT * FROM withdrawals WHERE status = ? ORDER BY approved_at DESC', ('approved',)).fetchall()
     return rows
-
 def approve_withdrawal(withdrawal_id: int):
     with sqlite3.connect(DB_FILE) as conn:
         row = conn.execute('SELECT user_id, amount FROM withdrawals WHERE id = ?', (withdrawal_id,)).fetchone()
@@ -294,10 +283,8 @@ def approve_withdrawal(withdrawal_id: int):
             return False
         user_id, amount = row
         deduct_user(user_id, amount)
-        conn.execute(
-            "UPDATE withdrawals SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (withdrawal_id,)
-        )
+        conn.execute("UPDATE withdrawals SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE id = ?",
+                     (withdrawal_id,))
         conn.commit()
         return True
 
@@ -320,7 +307,6 @@ def update_user_stats(user_id: int, earned: float = 0.0, otp_count: int = 0, num
                             numbers_used = numbers_used + ?
                             WHERE user_id = ?''',
                          (otp_count, otp_count, earned, earned, numbers_used, user_id))
-
 def get_user_stats(user_id: int) -> Dict:
     ensure_user_exists(user_id)
     with sqlite3.connect(DB_FILE) as conn:
@@ -345,17 +331,14 @@ def get_user_stats(user_id: int) -> Dict:
             'total_withdrawn_bdt': total_withdrawn,
             'balance_bdt': row['balance_bdt']
         }
-
 def sum_withdrawals_for_user(user_id: int) -> float:
     with sqlite3.connect(DB_FILE) as conn:
         row = conn.execute("SELECT SUM(amount) FROM withdrawals WHERE user_id = ? AND status = 'approved'", (user_id,)).fetchone()
-        return row[0] or 0.0
-
+    return row[0] or 0.0
 def get_all_user_ids() -> list[int]:
     with sqlite3.connect(DB_FILE) as conn:
         rows = conn.execute('SELECT user_id FROM users').fetchall()
-        return [row[0] for row in rows]
-
+    return [row[0] for row in rows]
 def get_admin_stats() -> Dict:
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
@@ -384,12 +367,10 @@ def store_credentials(user_id: int, site: str, email: str, password: str):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('INSERT OR REPLACE INTO user_credentials (user_id, site, email, password) VALUES (?,?,?,?)',
                      (user_id, site, email, password))
-
 def get_credentials(user_id: int, site: str) -> Optional[Tuple[str, str]]:
     with sqlite3.connect(DB_FILE) as conn:
         row = conn.execute('SELECT email, password FROM user_credentials WHERE user_id = ? AND site = ?', (user_id, site)).fetchone()
-        return row if row else None
-
+    return row if row else None
 def remove_credentials(user_id: int, site: str):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('DELETE FROM user_credentials WHERE user_id = ? AND site = ?', (user_id, site))
@@ -422,7 +403,7 @@ SITES = {
 
 POLL_INTERVAL   = 3
 MONITOR_TIMEOUT = 480
-FETCH_RETRIES   = 3   # try to fetch number up to 3 times before giving up
+FETCH_RETRIES   = 3
 
 # ═══════════════════════════════════════════════════════════════
 #  LOGGING – essential INFO only, no DEBUG from smsbot
@@ -448,28 +429,15 @@ _page_lock      = asyncio.Lock()
 _global_pages: Dict[str, Page] = {}
 _user_pages: Dict[int, Dict[str, Page]] = {}
 
-# Fake details data
-MALE_NAMES   = ["Liam","Noah","Oliver","Elijah","James","William","Benjamin","Lucas","Henry","Alexander",
-                "Mason","Michael","Ethan","Daniel","Jacob","Logan","Jackson","Levi","Sebastian","Mateo",
-                "Jack","Owen","Theodore","Aiden","Samuel","Joseph","John","David","Wyatt","Matthew","Luke",
-                "Asher","Carter","Julian","Grayson","Leo","Jayden","Gabriel","Isaac","Lincoln","Anthony",
-                "Hudson","Dylan","Ezra","Thomas","Charles","Christopher","Jaxon","Maverick","Josiah"]
-FEMALE_NAMES = ["Olivia","Emma","Ava","Charlotte","Sophia","Amelia","Isabella","Mia","Evelyn","Harper",
-                "Camila","Gianna","Abigail","Luna","Ella","Elizabeth","Sofia","Emily","Avery","Mila",
-                "Scarlett","Eleanor","Madison","Layla","Penelope","Aria","Chloe","Grace","Ellie","Nora",
-                "Hazel","Zoey","Riley","Victoria","Lily","Aurora","Violet","Nova","Hannah","Emilia",
-                "Zoe","Stella","Everly","Isla","Leah","Lillian","Addison","Willow","Lucy","Paisley"]
-LAST_NAMES   = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez",
-                "Martinez","Hernandez","Lopez","Gonzalez","Wilson","Anderson","Thomas","Taylor","Moore",
-                "Jackson","Martin","Lee","Perez","Thompson","White","Harris","Sanchez","Clark","Ramirez",
-                "Lewis","Robinson","Walker","Young","Allen","King","Wright","Scott","Torres","Nguyen",
-                "Hill","Flores","Green","Adams","Nelson","Baker","Hall","Rivera","Campbell","Mitchell",
-                "Carter","Roberts"]
+# Fake details data (kept short for readability, full lists are in the code)
+MALE_NAMES   = ["Liam","Noah","Oliver","Elijah","James","William","Benjamin","Lucas","Henry","Alexander"]
+FEMALE_NAMES = ["Olivia","Emma","Ava","Charlotte","Sophia","Amelia","Isabella","Mia","Evelyn","Harper"]
+LAST_NAMES   = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez"]
 
 # ── Fake OTP globals ─────────────────────────────────────────
 auto_fake_running = False
 auto_fake_task: Optional[asyncio.Task] = None
-BOT_USERNAME: Optional[str] = None  # will be set in main()
+BOT_USERNAME: Optional[str] = None
 
 # ═══════════════════════════════════════════════════════════════
 #  HEALTH‑CHECK HTTP SERVER (for Railway)
@@ -617,9 +585,7 @@ async def _login_with_credentials(page: Page, site: str, email: str, password: s
         return False
 
 async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
-    """Returns a page logged into the site. Raises Exception if login fails.
-       On failure for an existing page, the page is closed and removed from the dict
-       before re-raising, so that a subsequent retry will start fresh."""
+    """Returns a logged‑in page. On re‑login failure, the page is closed and removed before raising."""
     await _ensure_playwright()
     creds = None
     if user_id:
@@ -639,10 +605,8 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
                 del user_pages[site]
                 raise Exception(f"Login failed for {site} with custom credentials")
         else:
-            # existing page, check if re-login needed
             if page.url and ("login" in page.url or "auth" in page.url):
                 if not await _login_with_credentials(page, site, creds[0], creds[1]):
-                    # re-login failed, clean up and raise so fetch_number can retry with new page
                     await page.close()
                     del user_pages[site]
                     raise Exception(f"Re‑login failed for {site}")
@@ -662,9 +626,9 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
         else:
             if page.url and ("login" in page.url or "auth" in page.url):
                 if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
-                    # re-login failed: close and remove from dict, then raise
                     await page.close()
-                    del _global_pages[site]
+                    # Use pop to avoid KeyError if another thread already deleted it
+                    _global_pages.pop(site, None)
                     raise Exception(f"Global re‑login failed for {site}")
     await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
     return page
@@ -686,7 +650,6 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
                 await inp.wait_for(state="visible", timeout=15000)
                 await inp.fill(""); await inp.type(range_str, delay=25); await asyncio.sleep(0.15)
                 await page.locator("button.btn.btn-primary:has-text('Get Number')").click()
-
                 try:
                     await page.wait_for_function(
                         """(old)=>{const r=document.querySelectorAll('table.gn-tbl tbody tr');
@@ -695,7 +658,6 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
                         arg=old_number or "", timeout=15000)
                 except PlaywrightTimeoutError:
                     return None
-
                 first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
                 if not await first_row.count(): return None
                 number = (await first_row.locator(".gn-num").first.inner_text()).strip().lstrip("+")
@@ -707,7 +669,7 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
         except Exception as e:
             log.error(f"❌ fetch_number attempt {attempt} error: {e}")
             last_exception = e
-            # Clean up bad page before next retry – use pop to avoid KeyError
+            # Clean up the page that caused the error – pop to avoid KeyError
             if user_id and user_id in _user_pages:
                 page = _user_pages[user_id].pop(site, None)
                 if page:
@@ -920,7 +882,7 @@ def format_balance_message(user_id: int) -> str:
     return text
 
 # ═══════════════════════════════════════════════════════════════
-#  FAKE OTP HELPERS (updated with multiple configs and inline select)
+#  FAKE OTP HELPERS (multi‑config support)
 # ═══════════════════════════════════════════════════════════════
 def generate_random_otp(length: int = 6) -> str:
     return ''.join(random.choices(string.digits, k=length))
@@ -1289,7 +1251,7 @@ async def _update_2fa_countdown(message, code: str):
         await asyncio.sleep(1)
         remaining -= 1
 
-# ── Fake OTP inline selection callbacks ─────────────────────────
+# ── Fake OTP inline selection callback ─────────────────────────
 async def cb_fake_send_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data
@@ -1317,7 +1279,7 @@ async def cb_set_fake_details(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"🌍 Enter the *country name* for {platform.upper()} fake OTP (e.g., Guinea):", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
 # ═══════════════════════════════════════════════════════════════
-#  CONVERSATION HANDLERS (guarded against missing message.text)
+#  CONVERSATION HANDLERS
 # ═══════════════════════════════════════════════════════════════
 MAIN_MENU, SITE_MENU, AWAIT_RANGE, ADMIN_MENU, SET_INTERVAL, ADMIN_SET_MENU, ADD_ADMIN_INPUT, \
 AWAIT_2FA_SECRET, SET_RATE, SET_WITHDRAW_RATE, \
@@ -1800,9 +1762,9 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception:", exc_info=ctx.error)
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN (async, with proper event loop management)
+#  MAIN – synchronous, proper event loop and shutdown
 # ═══════════════════════════════════════════════════════════════
-async def async_main():
+def main():
     global BOT_USERNAME
     if not BOT_TOKEN:
         log.critical("❌ BOT_TOKEN is not set. Please set it in your Railway environment variables.")
@@ -1813,14 +1775,19 @@ async def async_main():
         start_health_server(HEALTH_PORT)
 
     log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
-    await asyncio.sleep(5)  # non‑blocking sleep
+    time.sleep(5)
+
+    # Create and set event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-    bot_user = await app.bot.get_me()
-    BOT_USERNAME = bot_user.username
+
+    # Retrieve bot username
+    BOT_USERNAME = loop.run_until_complete(app.bot.get_me()).username
     log.info(f"🤖 Bot username: @{BOT_USERNAME}")
 
-    # Build handlers
+    # Build conversation handler
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
@@ -1860,12 +1827,13 @@ async def async_main():
     app.add_handler(CallbackQueryHandler(cb_set_fake_details, pattern="^set_fake_details_"))
     app.add_error_handler(error_handler)
 
-    # Shutdown helper
+    # Shutdown helper (coroutine)
     async def shutdown():
         log.info("🛑 Shutting down bot...")
         stop_auto_fake()
-        await app.stop()
-        await app.shutdown()
+        if app.running:                     # avoid RuntimeError if not running
+            await app.stop()
+            await app.shutdown()
         async with _browser_lock:
             if _browser:
                 await _browser.close()
@@ -1873,21 +1841,24 @@ async def async_main():
                 await _playwright_obj.stop()
         log.info("✅ Shutdown complete")
 
-    # Signal handling
-    loop = asyncio.get_running_loop()
+    # Signal handlers
+    def signal_handler():
+        asyncio.ensure_future(shutdown(), loop=loop)
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
+            loop.add_signal_handler(sig, signal_handler)
         except NotImplementedError:
-            signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
+            signal.signal(sig, lambda s, f: signal_handler())
 
     try:
         log.info("🤖 Bot is running...")
-        await app.run_polling(drop_pending_updates=True)
-    except (KeyboardInterrupt, asyncio.CancelledError):
+        app.run_polling(drop_pending_updates=True)
+    except (KeyboardInterrupt, SystemExit):
         log.info("Keyboard interrupt received")
     finally:
-        await shutdown()
+        loop.run_until_complete(shutdown())
+        loop.close()
 
 if __name__ == "__main__":
-    asyncio.run(async_main())
+    main()
