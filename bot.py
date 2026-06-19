@@ -3,16 +3,13 @@ STEX SMS Telegram Bot – Full A‑Z (Railway Deployable + Balance + Withdrawal 
 ========================================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
 ✅ Silent mode: only essential startup logs are shown (DB, health, delay, bot running)
-✅ All other operational logs suppressed (logger level set to INFO)
-✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
-✅ Coloured buttons (primary / success / danger)
+✅ Persistent cookie‑based authentication – no repeated logins, session survives restarts
 ✅ Persistent SQLite database via $DATA_DIR
 ✅ Robust update handling: guards against missing message.text
 ✅ Number fetch retries (up to 3 attempts) to reduce "No number found"
-✅ Better page/browser cleanup on errors – no more KeyError, no stale pages
-✅ Full error recovery – long‑time, stable operation
 ✅ Fake OTP system – multiple saved countries per platform, inline selection, auto mode
-✅ Fixed: Login verification, stale page reuse, "Message not modified" error
+✅ Heartbeat log every 5 minutes to keep Railway log stream alive
+✅ Full error recovery – long‑time, stable operation
 """
 
 import asyncio
@@ -27,6 +24,7 @@ import signal
 import sys
 import threading
 import sqlite3
+import pathlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
 from typing import Optional, Dict, Set, Tuple, List
@@ -75,7 +73,7 @@ except ImportError:
     TOTP_AVAILABLE = False
 
 # ── playwright ───────────────────────────────────────────────
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, Page, BrowserContext
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 
@@ -103,6 +101,10 @@ RATE_CONFIG_FILE = os.path.join(DATA_DIR, "rate_config.json")
 WITHDRAW_CONFIG_FILE = os.path.join(DATA_DIR, "withdraw_config.json")
 ADMIN_USERS_FILE = os.path.join(DATA_DIR, "admin_users.json")
 FAKE_OTP_CONFIG_FILE = os.path.join(DATA_DIR, "fake_otp_config.json")
+AUTH_DIR = os.path.join(DATA_DIR, "auth")
+
+# Ensure auth directory exists
+pathlib.Path(AUTH_DIR).mkdir(parents=True, exist_ok=True)
 
 def _load_admins() -> Set[int]:
     s = set()
@@ -167,7 +169,6 @@ def load_fake_otp_config() -> Dict[str, List[Dict]]:
                     if isinstance(val, list):
                         result[k] = val
                     elif isinstance(val, dict) and "country_name" in val:
-                        # migrate old single config to list
                         result[k] = [val]
                 return result
         except:
@@ -379,16 +380,7 @@ def remove_credentials(user_id: int, site: str):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('DELETE FROM user_credentials WHERE user_id = ? AND site = ?', (user_id, site))
     async def _close_user_page():
-        if user_id in _user_pages:
-            pages = _user_pages[user_id]
-            if site in pages:
-                page = pages.pop(site)
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-            if not pages:
-                del _user_pages[user_id]
+        await _close_user_context(user_id, site)
     asyncio.create_task(_close_user_page())
 
 # ── Site definitions ─────────────────────────────────────────
@@ -432,6 +424,8 @@ _browser_lock   = asyncio.Lock()
 _page_lock      = asyncio.Lock()
 _global_pages: Dict[str, Page] = {}
 _user_pages: Dict[int, Dict[str, Page]] = {}
+_global_contexts: Dict[str, BrowserContext] = {}
+_user_contexts: Dict[Tuple[int, str], BrowserContext] = {}
 
 # Fake details data
 MALE_NAMES   = ["Liam","Noah","Oliver","Elijah","James","William","Benjamin","Lucas","Henry","Alexander",
@@ -565,8 +559,101 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer("You are not yet a member of the channel.", show_alert=True)
 
 # ═══════════════════════════════════════════════════════════════
-#  BROWSER / SCRAPER – improved error handling & retries
+#  BROWSER CONTEXT MANAGEMENT (persistent cookies)
 # ═══════════════════════════════════════════════════════════════
+async def _is_logged_in(page: Page) -> bool:
+    try:
+        await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=5000)
+        return True
+    except:
+        return False
+
+async def _get_context(site: str, user_id: int = None) -> BrowserContext:
+    """Return a logged‑in context, reusing stored cookies if possible."""
+    await _ensure_playwright()
+    key = site if user_id is None else (user_id, site)
+    ctx_store = _global_contexts if user_id is None else _user_contexts
+    context = ctx_store.get(key)
+    if context and not context.is_closed():
+        return context
+
+    auth_file = os.path.join(AUTH_DIR, f"global_{site}.json" if user_id is None else f"user_{user_id}_{site}.json")
+    if os.path.exists(auth_file):
+        context = await _browser.new_context(storage_state=auth_file)
+    else:
+        context = await _browser.new_context()
+    await context.grant_permissions(["clipboard-read"])
+    # Check login status
+    page = await context.new_page()
+    try:
+        await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
+        logged_in = await _is_logged_in(page)
+        if not logged_in:
+            creds = get_credentials(user_id, site) if user_id else (SMS_EMAIL, SMS_PASSWORD)
+            if creds:
+                login_ok = await _login_with_credentials(page, site, creds[0], creds[1])
+                if not login_ok:
+                    await page.close()
+                    await context.close()
+                    if os.path.exists(auth_file):
+                        os.remove(auth_file)
+                    raise Exception(f"Login failed for {site}")
+                # After login, navigate back to dialer and re-check
+                await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
+                logged_in = await _is_logged_in(page)
+                if not logged_in:
+                    await page.close()
+                    await context.close()
+                    if os.path.exists(auth_file):
+                        os.remove(auth_file)
+                    raise Exception(f"Post‑login check failed for {site}")
+                # Save storage state
+                await context.storage_state(path=auth_file)
+            else:
+                await page.close()
+                await context.close()
+                raise Exception(f"No credentials for {site}")
+    except Exception as e:
+        await page.close()
+        await context.close()
+        if os.path.exists(auth_file):
+            os.remove(auth_file)
+        raise
+    finally:
+        await page.close()
+    ctx_store[key] = context
+    return context
+
+async def _close_user_context(user_id: int, site: str):
+    key = (user_id, site)
+    if key in _user_contexts:
+        ctx = _user_contexts.pop(key)
+        await ctx.close()
+    auth_file = os.path.join(AUTH_DIR, f"user_{user_id}_{site}.json")
+    if os.path.exists(auth_file):
+        os.remove(auth_file)
+    if user_id in _user_pages and site in _user_pages[user_id]:
+        page = _user_pages[user_id].pop(site, None)
+        if page:
+            try: await page.close()
+            except: pass
+        if not _user_pages[user_id]:
+            del _user_pages[user_id]
+
+async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
+    """Returns a page that is certainly logged in, using persistent cookie context."""
+    await _ensure_playwright()
+    context = await _get_context(site, user_id)
+    page_store = _global_pages if user_id is None else _user_pages.setdefault(user_id, {})
+    page = page_store.get(site)
+    if page is None or page.is_closed():
+        page = await context.new_page()
+        page_store[site] = page
+    # Ensure we are on dialer page
+    if "/dialer/" not in page.url:
+        await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
+    return page
+
 async def _ensure_playwright():
     global _playwright_obj, _browser
     async with _browser_lock:
@@ -593,7 +680,6 @@ async def _login_with_credentials(page: Page, site: str, email: str, password: s
         except Exception:
             if "/dialer/" in page.url: return True
             try:
-                # Wait for a reliable logged‑in element (e.g., user icon, number table)
                 await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=10000)
                 return True
             except Exception: pass
@@ -602,61 +688,9 @@ async def _login_with_credentials(page: Page, site: str, email: str, password: s
         log.error(f"Login error: {e}")
         return False
 
-async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
-    """Returns a page that is **certainly** logged in. On failure, the page is closed and removed before raising."""
-    await _ensure_playwright()
-    creds = None
-    if user_id:
-        creds = get_credentials(user_id, site)
-    if creds:
-        user_pages = _user_pages.setdefault(user_id, {})
-        page = user_pages.get(site)
-        if page is None or page.is_closed():
-            context = await _browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width":1280,"height":800})
-            await context.grant_permissions(["clipboard-read"])
-            page = await context.new_page()
-            user_pages[site] = page
-            if not await _login_with_credentials(page, site, creds[0], creds[1]):
-                await page.close()
-                del user_pages[site]
-                raise Exception(f"Login failed for {site} with custom credentials")
-        else:
-            # Verify that the page is actually logged in (not just missing 'login' in URL)
-            try:
-                await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=5000)
-            except:
-                # Not logged in – try to re‑login
-                if not await _login_with_credentials(page, site, creds[0], creds[1]):
-                    await page.close()
-                    del user_pages[site]
-                    raise Exception(f"Re‑login failed for {site}")
-    else:
-        page = _global_pages.get(site)
-        if page is None or page.is_closed():
-            context = await _browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width":1280,"height":800})
-            await context.grant_permissions(["clipboard-read"])
-            page = await context.new_page()
-            _global_pages[site] = page
-            if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
-                await page.close()
-                # Use pop to avoid KeyError
-                _global_pages.pop(site, None)
-                raise Exception(f"Global login failed for {site}")
-        else:
-            try:
-                await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=5000)
-            except:
-                if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
-                    await page.close()
-                    _global_pages.pop(site, None)
-                    raise Exception(f"Global re‑login failed for {site}")
-    await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
-    return page
-
+# ═══════════════════════════════════════════════════════════════
+#  NUMBER FETCH & OTP POLL
+# ═══════════════════════════════════════════════════════════════
 async def fetch_number(range_str: str, site: str, user_id: int = None) -> Optional[dict]:
     """Try to fetch a number up to FETCH_RETRIES times."""
     last_exception = None
@@ -695,19 +729,21 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
         except Exception as e:
             log.error(f"❌ fetch_number attempt {attempt} error: {e}")
             last_exception = e
-            # Clean up the problematic page so the next attempt gets a fresh one
-            if user_id and user_id in _user_pages:
-                page = _user_pages[user_id].pop(site, None)
-                if page:
-                    try: await page.close()
-                    except: pass
-                if not _user_pages[user_id]:
+            # Clean up problematic page/context to force fresh login next time
+            if user_id:
+                key = (user_id, site)
+                ctx = _user_contexts.pop(key, None)
+                if ctx: await ctx.close()
+                if user_id in _user_pages and site in _user_pages[user_id]:
+                    page = _user_pages[user_id].pop(site, None)
+                    if page: await page.close()
+                if user_id in _user_pages and not _user_pages[user_id]:
                     del _user_pages[user_id]
             else:
+                ctx = _global_contexts.pop(site, None)
+                if ctx: await ctx.close()
                 page = _global_pages.pop(site, None)
-                if page:
-                    try: await page.close()
-                    except: pass
+                if page: await page.close()
             await asyncio.sleep(1)
     log.error(f"❌ All {FETCH_RETRIES} fetch attempts failed. Last error: {last_exception}")
     return None
@@ -1291,15 +1327,9 @@ async def cb_fake_send_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cfg = configs[index]
         ok = await send_fake_otp(ctx.application, platform, cfg)
         new_text = f"✅ Sent {platform.upper()} OTP from {cfg['country_name']}." if ok else f"❌ Failed to send {platform.upper()} OTP."
-        # Avoid editing if the text would be identical (prevents BadRequest)
         if query.message.text != new_text:
-            try:
-                await query.edit_message_text(new_text)
-            except BadRequest:
-                pass
-        else:
-            # Text is the same, just answer silently
-            pass
+            try: await query.edit_message_text(new_text)
+            except BadRequest: pass
     else:
         await query.answer("Invalid selection.", show_alert=True)
 
@@ -1794,8 +1824,13 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception:", exc_info=ctx.error)
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN – synchronous, proper event loop and shutdown
+#  MAIN – robust startup with heartbeat & proper shutdown
 # ═══════════════════════════════════════════════════════════════
+async def heartbeat():
+    while True:
+        await asyncio.sleep(300)
+        log.info("💓 Heartbeat – bot alive")
+
 def main():
     global BOT_USERNAME
     if not BOT_TOKEN:
@@ -1809,13 +1844,12 @@ def main():
     log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
     time.sleep(5)
 
-    # Create and set event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-    # Retrieve bot username
+    # Get bot username
     BOT_USERNAME = loop.run_until_complete(app.bot.get_me()).username
     log.info(f"🤖 Bot username: @{BOT_USERNAME}")
 
@@ -1859,10 +1893,20 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_set_fake_details, pattern="^set_fake_details_"))
     app.add_error_handler(error_handler)
 
-    # Shutdown helper (coroutine)
     async def shutdown():
         log.info("🛑 Shutting down bot...")
         stop_auto_fake()
+        # Close all contexts and pages
+        for ctx in list(_global_contexts.values()):
+            try: await ctx.close()
+            except: pass
+        _global_contexts.clear()
+        for ctx in list(_user_contexts.values()):
+            try: await ctx.close()
+            except: pass
+        _user_contexts.clear()
+        _global_pages.clear()
+        _user_pages.clear()
         if app.running:
             await app.stop()
             await app.shutdown()
@@ -1873,20 +1917,32 @@ def main():
                 await _playwright_obj.stop()
         log.info("✅ Shutdown complete")
 
-    # Signal handlers
-    def signal_handler():
-        asyncio.ensure_future(shutdown(), loop=loop)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    async def run_bot():
+        # start heartbeat
+        asyncio.create_task(heartbeat())
         try:
-            loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError:
-            signal.signal(sig, lambda s, f: signal_handler())
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            log.info("🤖 Bot is running...")
+            # Wait until a stop signal
+            stop_event = asyncio.Event()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop_event.set)
+                except NotImplementedError:
+                    pass
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.exception(f"Fatal bot error: {e}")
+        finally:
+            await shutdown()
 
     try:
-        log.info("🤖 Bot is running...")
-        app.run_polling(drop_pending_updates=True)
-    except (KeyboardInterrupt, SystemExit):
+        loop.run_until_complete(run_bot())
+    except KeyboardInterrupt:
         log.info("Keyboard interrupt received")
     finally:
         loop.run_until_complete(shutdown())
