@@ -12,6 +12,7 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal 
 ✅ Better page/browser cleanup on errors
 ✅ Full error recovery – long‑time, stable operation
 ✅ Fake OTP system – multiple saved countries per platform, inline selection, auto mode
+✅ Fixed: KeyError on cleanup, re‑login failure, event loop shutdown
 """
 
 import asyncio
@@ -616,6 +617,9 @@ async def _login_with_credentials(page: Page, site: str, email: str, password: s
         return False
 
 async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
+    """Returns a page logged into the site. Raises Exception if login fails.
+       On failure for an existing page, the page is closed and removed from the dict
+       before re-raising, so that a subsequent retry will start fresh."""
     await _ensure_playwright()
     creds = None
     if user_id:
@@ -635,8 +639,12 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
                 del user_pages[site]
                 raise Exception(f"Login failed for {site} with custom credentials")
         else:
+            # existing page, check if re-login needed
             if page.url and ("login" in page.url or "auth" in page.url):
                 if not await _login_with_credentials(page, site, creds[0], creds[1]):
+                    # re-login failed, clean up and raise so fetch_number can retry with new page
+                    await page.close()
+                    del user_pages[site]
                     raise Exception(f"Re‑login failed for {site}")
     else:
         page = _global_pages.get(site)
@@ -654,6 +662,9 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
         else:
             if page.url and ("login" in page.url or "auth" in page.url):
                 if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
+                    # re-login failed: close and remove from dict, then raise
+                    await page.close()
+                    del _global_pages[site]
                     raise Exception(f"Global re‑login failed for {site}")
     await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
     return page
@@ -696,17 +707,19 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
         except Exception as e:
             log.error(f"❌ fetch_number attempt {attempt} error: {e}")
             last_exception = e
-            # Clean up bad page before next retry
-            if user_id and user_id in _user_pages and site in _user_pages[user_id]:
-                try:
-                    await _user_pages[user_id][site].close()
-                except: pass
-                del _user_pages[user_id][site]
-            elif site in _global_pages:
-                try:
-                    await _global_pages[site].close()
-                except: pass
-                del _global_pages[site]
+            # Clean up bad page before next retry – use pop to avoid KeyError
+            if user_id and user_id in _user_pages:
+                page = _user_pages[user_id].pop(site, None)
+                if page:
+                    try: await page.close()
+                    except: pass
+                if not _user_pages[user_id]:
+                    del _user_pages[user_id]
+            else:
+                page = _global_pages.pop(site, None)
+                if page:
+                    try: await page.close()
+                    except: pass
             await asyncio.sleep(1)
     log.error(f"❌ All {FETCH_RETRIES} fetch attempts failed. Last error: {last_exception}")
     return None
@@ -910,18 +923,12 @@ def format_balance_message(user_id: int) -> str:
 #  FAKE OTP HELPERS (updated with multiple configs and inline select)
 # ═══════════════════════════════════════════════════════════════
 def generate_random_otp(length: int = 6) -> str:
-    """Generate a random OTP of given length (e.g., 5 or 6)."""
     return ''.join(random.choices(string.digits, k=length))
 
 def generate_random_last3() -> str:
     return ''.join(random.choices(string.digits, k=3))
 
 def build_fake_otp_message(platform: str, config_override: Optional[Dict] = None) -> Optional[str]:
-    """
-    Build a fake OTP message.
-    platform: 'fb5', 'fb6', 'ig'
-    config_override: {'country_name':..., 'country_code':...} if provided, else uses global list.
-    """
     base_platform = "fb" if platform.startswith("fb") else "ig"
     if config_override:
         country_name = config_override["country_name"]
@@ -930,7 +937,7 @@ def build_fake_otp_message(platform: str, config_override: Optional[Dict] = None
         configs = FAKE_OTP_CONFIG.get(base_platform, [])
         if not configs:
             return None
-        cfg = configs[0]  # fallback; should never be called directly like this in new logic
+        cfg = configs[0]
         country_name = cfg["country_name"]
         country_code = cfg["country_code"]
 
@@ -939,24 +946,17 @@ def build_fake_otp_message(platform: str, config_override: Optional[Dict] = None
 
     if platform == "fb5":
         otp = generate_random_otp(5)
-        # English by default, Hindi 5% of the time
-        if random.random() < 0.05:
-            body = f"<#> {otp} आपका Facebook कोड है H29Q+Fsn4Sr"
-        else:
-            body = f"<#> {otp} is your Facebook code H29Q+Fsn4Sr"
+        body = f"<#> {otp} आपका Facebook कोड है H29Q+Fsn4Sr" if random.random()<0.05 else f"<#> {otp} is your Facebook code H29Q+Fsn4Sr"
         otp_display = otp
     elif platform == "fb6":
         otp = generate_random_otp(6)
-        if random.random() < 0.05:
-            body = f"<#> {otp} आपका Facebook कोड है H29Q+Fsn4Sr"
-        else:
-            body = f"<#> {otp} is your Facebook code H29Q+Fsn4Sr"
+        body = f"<#> {otp} आपका Facebook कोड है H29Q+Fsn4Sr" if random.random()<0.05 else f"<#> {otp} is your Facebook code H29Q+Fsn4Sr"
         otp_display = otp
     else:  # ig
         otp = generate_random_otp(6)
         suffix = random.choice(["GdDGcwrWHVm", "SIYRxKrru1t"])
         body = f"<#> {otp[:3]} {otp[3:]} is your Instagram code. Don't share it. {suffix}"
-        otp_display = otp  # raw, no space
+        otp_display = otp
 
     msg = (
         f"📨 {country_name} OTP Received\n"
@@ -969,7 +969,6 @@ def build_fake_otp_message(platform: str, config_override: Optional[Dict] = None
     return msg
 
 def get_number_button() -> Optional[InlineKeyboardMarkup]:
-    """Inline button '🤖 Get Number' pointing to bot start."""
     if BOT_USERNAME:
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("🤖 Get Number", url=f"https://t.me/{BOT_USERNAME}?start=start")
@@ -1294,7 +1293,6 @@ async def _update_2fa_countdown(message, code: str):
 async def cb_fake_send_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data
-    # pattern: fake_send_fb5_0, fake_send_fb6_1, fake_send_ig_2
     parts = data.split("_", 3)  # ['fake','send','fb5','0']
     if len(parts)!=4 or parts[0]!="fake" or parts[1]!="send": return
     platform = parts[2]  # fb5, fb6, ig
@@ -1336,7 +1334,6 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _check_membership(update, ctx): return ConversationHandler.END
 
-    # ── guard against updates without a message text ──
     if not update.message or not update.message.text:
         return None
 
@@ -1558,7 +1555,6 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ No details set. Use 'Set Details' first.", reply_markup=fake_otp_menu_kb())
                 return ADMIN_MENU
             platform_code = "fb5" if text == "FB Send 5" else ("fb6" if text == "FB Send 6" else "ig")
-            # build inline keyboard with config list
             buttons = []
             for idx, cfg in enumerate(configs):
                 label = f"{cfg['country_name']} (+{cfg['country_code']})"
@@ -1571,7 +1567,6 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 stop_auto_fake()
                 await update.message.reply_text("⏹ Auto fake OTP stopped.", reply_markup=fake_otp_menu_kb())
             else:
-                # Check if at least one config exists
                 if not FAKE_OTP_CONFIG.get("fb") and not FAKE_OTP_CONFIG.get("ig"):
                     await update.message.reply_text("❌ Set at least one platform details first.", reply_markup=fake_otp_menu_kb())
                     return ADMIN_MENU
@@ -1652,7 +1647,7 @@ async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.copy(chat_id=user_id)
             success += 1
-        except Exception as e:
+        except Exception:
             pass
     await update.message.reply_text(f"✅ Broadcast sent to {success}/{len(all_users)} users.", reply_markup=admin_menu_kb(uid))
     return ADMIN_MENU
@@ -1805,9 +1800,9 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception:", exc_info=ctx.error)
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN (with early bot username retrieval)
+#  MAIN (async, with proper event loop management)
 # ═══════════════════════════════════════════════════════════════
-def main():
+async def async_main():
     global BOT_USERNAME
     if not BOT_TOKEN:
         log.critical("❌ BOT_TOKEN is not set. Please set it in your Railway environment variables.")
@@ -1818,17 +1813,11 @@ def main():
         start_health_server(HEALTH_PORT)
 
     log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
-    time.sleep(5)
+    await asyncio.sleep(5)  # non‑blocking sleep
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-
-    # Retrieve bot username once
-    async def get_username():
-        bot_user = await app.bot.get_me()
-        return bot_user.username
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    BOT_USERNAME = loop.run_until_complete(get_username())
+    bot_user = await app.bot.get_me()
+    BOT_USERNAME = bot_user.username
     log.info(f"🤖 Bot username: @{BOT_USERNAME}")
 
     # Build handlers
@@ -1867,11 +1856,11 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_login_site_selected, pattern="^login_site_"))
     app.add_handler(CallbackQueryHandler(cb_accounts_options, pattern="^accounts_login$|^accounts_logout$"))
     app.add_handler(CallbackQueryHandler(cb_logout_site_selected, pattern="^logout_site_"))
-    # Fake OTP callbacks
     app.add_handler(CallbackQueryHandler(cb_fake_send_inline, pattern="^fake_send_"))
     app.add_handler(CallbackQueryHandler(cb_set_fake_details, pattern="^set_fake_details_"))
     app.add_error_handler(error_handler)
 
+    # Shutdown helper
     async def shutdown():
         log.info("🛑 Shutting down bot...")
         stop_auto_fake()
@@ -1884,24 +1873,21 @@ def main():
                 await _playwright_obj.stop()
         log.info("✅ Shutdown complete")
 
-    def signal_handler():
-        log.info("Received termination signal")
-        asyncio.create_task(shutdown())
-
+    # Signal handling
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, signal_handler)
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
         except NotImplementedError:
             signal.signal(sig, lambda s, f: asyncio.create_task(shutdown()))
 
     try:
         log.info("🤖 Bot is running...")
-        app.run_polling(drop_pending_updates=True)
-    except KeyboardInterrupt:
+        await app.run_polling(drop_pending_updates=True)
+    except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Keyboard interrupt received")
     finally:
-        loop.run_until_complete(shutdown())
-        loop.close()
+        await shutdown()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())
