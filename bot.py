@@ -1,5 +1,5 @@
 """
-STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal + Fake OTP)
+STEX SMS Telegram Bot – Full A‑Z (Railway Deployable + Balance + Withdrawal + Fake OTP)
 ========================================================================================
 ✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
 ✅ Silent mode: only essential startup logs are shown (DB, health, delay, bot running)
@@ -12,7 +12,7 @@ STEX SMS Telegram Bot — Full A‑Z (Railway Deployable + Balance + Withdrawal 
 ✅ Better page/browser cleanup on errors – no more KeyError, no stale pages
 ✅ Full error recovery – long‑time, stable operation
 ✅ Fake OTP system – multiple saved countries per platform, inline selection, auto mode
-✅ Fixed: event loop / shutdown errors, KeyError on cleanup, re‑login failure handling
+✅ Fixed: Login verification, stale page reuse, "Message not modified" error
 """
 
 import asyncio
@@ -181,7 +181,7 @@ def save_fake_otp_config(config: Dict[str, List[Dict]]):
 FAKE_OTP_CONFIG = load_fake_otp_config()
 
 # ── Database (unchanged) ─────────────────────────────────────
-EXCHANGE_RATE = 125.0
+EXCHANGE_RATE = 125.0   # 1 USD = 125 BDT
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -263,8 +263,10 @@ def update_wallet(user_id: int, wallet_type: str, number: str):
             conn.execute(f'UPDATE users SET {col} = ? WHERE user_id = ?', (number, user_id))
 def create_withdrawal(user_id: int, method: str, account: str, amount: float) -> int:
     with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.execute('INSERT INTO withdrawals (user_id, method, account, amount) VALUES (?,?,?,?)',
-                           (user_id, method, account, amount))
+        cur = conn.execute(
+            'INSERT INTO withdrawals (user_id, method, account, amount) VALUES (?,?,?,?)',
+            (user_id, method, account, amount)
+        )
         return cur.lastrowid
 def get_pending_withdrawals():
     with sqlite3.connect(DB_FILE) as conn:
@@ -283,8 +285,10 @@ def approve_withdrawal(withdrawal_id: int):
             return False
         user_id, amount = row
         deduct_user(user_id, amount)
-        conn.execute("UPDATE withdrawals SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE id = ?",
-                     (withdrawal_id,))
+        conn.execute(
+            "UPDATE withdrawals SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (withdrawal_id,)
+        )
         conn.commit()
         return True
 
@@ -429,10 +433,23 @@ _page_lock      = asyncio.Lock()
 _global_pages: Dict[str, Page] = {}
 _user_pages: Dict[int, Dict[str, Page]] = {}
 
-# Fake details data (kept short for readability, full lists are in the code)
-MALE_NAMES   = ["Liam","Noah","Oliver","Elijah","James","William","Benjamin","Lucas","Henry","Alexander"]
-FEMALE_NAMES = ["Olivia","Emma","Ava","Charlotte","Sophia","Amelia","Isabella","Mia","Evelyn","Harper"]
-LAST_NAMES   = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez"]
+# Fake details data
+MALE_NAMES   = ["Liam","Noah","Oliver","Elijah","James","William","Benjamin","Lucas","Henry","Alexander",
+                "Mason","Michael","Ethan","Daniel","Jacob","Logan","Jackson","Levi","Sebastian","Mateo",
+                "Jack","Owen","Theodore","Aiden","Samuel","Joseph","John","David","Wyatt","Matthew","Luke",
+                "Asher","Carter","Julian","Grayson","Leo","Jayden","Gabriel","Isaac","Lincoln","Anthony",
+                "Hudson","Dylan","Ezra","Thomas","Charles","Christopher","Jaxon","Maverick","Josiah"]
+FEMALE_NAMES = ["Olivia","Emma","Ava","Charlotte","Sophia","Amelia","Isabella","Mia","Evelyn","Harper",
+                "Camila","Gianna","Abigail","Luna","Ella","Elizabeth","Sofia","Emily","Avery","Mila",
+                "Scarlett","Eleanor","Madison","Layla","Penelope","Aria","Chloe","Grace","Ellie","Nora",
+                "Hazel","Zoey","Riley","Victoria","Lily","Aurora","Violet","Nova","Hannah","Emilia",
+                "Zoe","Stella","Everly","Isla","Leah","Lillian","Addison","Willow","Lucy","Paisley"]
+LAST_NAMES   = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez",
+                "Martinez","Hernandez","Lopez","Gonzalez","Wilson","Anderson","Thomas","Taylor","Moore",
+                "Jackson","Martin","Lee","Perez","Thompson","White","Harris","Sanchez","Clark","Ramirez",
+                "Lewis","Robinson","Walker","Young","Allen","King","Wright","Scott","Torres","Nguyen",
+                "Hill","Flores","Green","Adams","Nelson","Baker","Hall","Rivera","Campbell","Mitchell",
+                "Carter","Roberts"]
 
 # ── Fake OTP globals ─────────────────────────────────────────
 auto_fake_running = False
@@ -576,7 +593,8 @@ async def _login_with_credentials(page: Page, site: str, email: str, password: s
         except Exception:
             if "/dialer/" in page.url: return True
             try:
-                await page.wait_for_selector("table.gn-tbl, input.gn-range-input", timeout=5000)
+                # Wait for a reliable logged‑in element (e.g., user icon, number table)
+                await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=10000)
                 return True
             except Exception: pass
         return False
@@ -585,7 +603,7 @@ async def _login_with_credentials(page: Page, site: str, email: str, password: s
         return False
 
 async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
-    """Returns a logged‑in page. On re‑login failure, the page is closed and removed before raising."""
+    """Returns a page that is **certainly** logged in. On failure, the page is closed and removed before raising."""
     await _ensure_playwright()
     creds = None
     if user_id:
@@ -605,7 +623,11 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
                 del user_pages[site]
                 raise Exception(f"Login failed for {site} with custom credentials")
         else:
-            if page.url and ("login" in page.url or "auth" in page.url):
+            # Verify that the page is actually logged in (not just missing 'login' in URL)
+            try:
+                await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=5000)
+            except:
+                # Not logged in – try to re‑login
                 if not await _login_with_credentials(page, site, creds[0], creds[1]):
                     await page.close()
                     del user_pages[site]
@@ -621,13 +643,15 @@ async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
             _global_pages[site] = page
             if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
                 await page.close()
-                del _global_pages[site]
+                # Use pop to avoid KeyError
+                _global_pages.pop(site, None)
                 raise Exception(f"Global login failed for {site}")
         else:
-            if page.url and ("login" in page.url or "auth" in page.url):
+            try:
+                await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=5000)
+            except:
                 if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
                     await page.close()
-                    # Use pop to avoid KeyError if another thread already deleted it
                     _global_pages.pop(site, None)
                     raise Exception(f"Global re‑login failed for {site}")
     await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
@@ -650,6 +674,7 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
                 await inp.wait_for(state="visible", timeout=15000)
                 await inp.fill(""); await inp.type(range_str, delay=25); await asyncio.sleep(0.15)
                 await page.locator("button.btn.btn-primary:has-text('Get Number')").click()
+
                 try:
                     await page.wait_for_function(
                         """(old)=>{const r=document.querySelectorAll('table.gn-tbl tbody tr');
@@ -658,6 +683,7 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
                         arg=old_number or "", timeout=15000)
                 except PlaywrightTimeoutError:
                     return None
+
                 first_row = page.locator("table.gn-tbl tbody tr").filter(has=page.locator(".gn-num")).first
                 if not await first_row.count(): return None
                 number = (await first_row.locator(".gn-num").first.inner_text()).strip().lstrip("+")
@@ -669,7 +695,7 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
         except Exception as e:
             log.error(f"❌ fetch_number attempt {attempt} error: {e}")
             last_exception = e
-            # Clean up the page that caused the error – pop to avoid KeyError
+            # Clean up the problematic page so the next attempt gets a fresh one
             if user_id and user_id in _user_pages:
                 page = _user_pages[user_id].pop(site, None)
                 if page:
@@ -1251,23 +1277,29 @@ async def _update_2fa_countdown(message, code: str):
         await asyncio.sleep(1)
         remaining -= 1
 
-# ── Fake OTP inline selection callback ─────────────────────────
+# ── Fake OTP inline selection callback (fixed message-not-modified) ──
 async def cb_fake_send_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data
     parts = data.split("_", 3)  # ['fake','send','fb5','0']
     if len(parts)!=4 or parts[0]!="fake" or parts[1]!="send": return
-    platform = parts[2]  # fb5, fb6, ig
+    platform = parts[2]
     index = int(parts[3])
     base = "fb" if platform.startswith("fb") else "ig"
     configs = FAKE_OTP_CONFIG.get(base, [])
     if 0 <= index < len(configs):
         cfg = configs[index]
         ok = await send_fake_otp(ctx.application, platform, cfg)
-        if ok:
-            await query.edit_message_text(f"✅ Sent {platform.upper()} OTP from {cfg['country_name']}.")
+        new_text = f"✅ Sent {platform.upper()} OTP from {cfg['country_name']}." if ok else f"❌ Failed to send {platform.upper()} OTP."
+        # Avoid editing if the text would be identical (prevents BadRequest)
+        if query.message.text != new_text:
+            try:
+                await query.edit_message_text(new_text)
+            except BadRequest:
+                pass
         else:
-            await query.edit_message_text(f"❌ Failed to send {platform.upper()} OTP.")
+            # Text is the same, just answer silently
+            pass
     else:
         await query.answer("Invalid selection.", show_alert=True)
 
@@ -1831,7 +1863,7 @@ def main():
     async def shutdown():
         log.info("🛑 Shutting down bot...")
         stop_auto_fake()
-        if app.running:                     # avoid RuntimeError if not running
+        if app.running:
             await app.stop()
             await app.shutdown()
         async with _browser_lock:
