@@ -1,70 +1,108 @@
 """
-STEX SMS Telegram Bot – Persistent Session + Railway Ready
-===========================================================
-✅ Persistent browser session via storage‑state (cookies saved)
-✅ Automatic re‑login if session expired
-✅ Health server + heartbeat keep Railway logs alive
-✅ All features: OTP, 2FA, Fake Details, Balance, Withdraw, Admin, Fake OTP
+STEX SMS Telegram Bot – Full A‑Z (Railway Deployable + Balance + Withdrawal + Fake OTP)
+========================================================================================
+✅ Railway‑ready: early BOT_TOKEN check, health server, optional volume persistence
+✅ Silent mode: only essential startup logs are shown (DB, health, delay, bot running)
+✅ All other operational logs suppressed (logger level set to INFO)
+✅ Status, Accounts (Log In/Out), Admin Panel, Broadcast, Statistics
+✅ Coloured buttons (primary / success / danger)
+✅ Persistent SQLite database via $DATA_DIR
+✅ Robust update handling: guards against missing message.text
+✅ Number fetch retries (up to 3 attempts) to reduce "No number found"
+✅ Better page/browser cleanup on errors – no more KeyError, no stale pages
+✅ Full error recovery – long‑time, stable operation
+✅ Fake OTP system – multiple saved countries per platform, inline selection, auto mode
+✅ Fixed: Login verification, stale page reuse, "Message not modified" error
 """
 
-import asyncio, logging, re, os, json, time, random, string, signal, sys, threading, sqlite3
+import asyncio
+import logging
+import re
+import os
+import json
+import time
+import random
+import string
+import signal
+import sys
+import threading
+import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
 from typing import Optional, Dict, Set, Tuple, List
-from pathlib import Path
 
-# Load .env (optional)
+# ── load .env (optional) ─────────────────────────────────────
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# Telegram
+# ── telegram imports ─────────────────────────────────────────
 from telegram import (
     Update,
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardRemove, ChatMember, CopyTextButton
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+    ChatMember,
 )
 from telegram.helpers import escape_markdown
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, ConversationHandler
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+    ConversationHandler,
 )
 from telegram.error import BadRequest
 
-# 2FA
+# CopyTextButton – python‑telegram‑bot >= 21.1
+try:
+    from telegram import CopyTextButton
+    COPY_SUPPORTED = True
+except ImportError:
+    COPY_SUPPORTED = False
+
+# ── 2FA support ─────────────────────────────────────────────
 try:
     import pyotp
     TOTP_AVAILABLE = True
 except ImportError:
     TOTP_AVAILABLE = False
 
-# Playwright
+# ── playwright ───────────────────────────────────────────────
 from playwright.async_api import async_playwright, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-# ===================== CONFIGURATION =====================
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
-BOT_NAME       = os.getenv("BOT_NAME", "SMS OTP Bot")
-SMS_EMAIL      = os.getenv("STEX_EMAIL", "")
-SMS_PASSWORD   = os.getenv("STEX_PASSWORD", "")
-OTP_GROUP_ID   = int(os.getenv("OTP_GROUP_ID", "0"))
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURATION (from environment)
+# ═══════════════════════════════════════════════════════════════
+BOT_TOKEN      = os.getenv("BOT_TOKEN",      "")
+BOT_NAME       = os.getenv("BOT_NAME",       "SMS OTP Bot")
+SMS_EMAIL      = os.getenv("STEX_EMAIL",     "")
+SMS_PASSWORD   = os.getenv("STEX_PASSWORD",  "")
+OTP_GROUP_ID   = int(os.getenv("OTP_GROUP_ID",   "0"))
 OTP_GROUP_LINK = os.getenv("OTP_GROUP_LINK", "https://t.me/your_otp_group")
 OWNER_USER_ID  = 5705479420
-HEALTH_PORT    = int(os.getenv("PORT", "0"))
 
-DATA_DIR       = os.getenv("DATA_DIR", ".")
-DB_FILE        = os.path.join(DATA_DIR, "bot_data.db")
+# Health‑check port (Railway sets PORT)
+HEALTH_PORT = int(os.getenv("PORT", "0"))
+
+# Admin users – loaded from .env + persisted file
+_admin_users_env = os.getenv("ADMIN_USERS", "").strip()
+
+# ── Persistent data directory (optional Railway volume) ──────
+DATA_DIR = os.getenv("DATA_DIR", ".")
+DB_FILE = os.path.join(DATA_DIR, "bot_data.db")
 RATE_CONFIG_FILE = os.path.join(DATA_DIR, "rate_config.json")
 WITHDRAW_CONFIG_FILE = os.path.join(DATA_DIR, "withdraw_config.json")
 ADMIN_USERS_FILE = os.path.join(DATA_DIR, "admin_users.json")
 FAKE_OTP_CONFIG_FILE = os.path.join(DATA_DIR, "fake_otp_config.json")
-STORAGE_STATE_DIR = os.path.join(DATA_DIR, "browser_states")
-
-Path(STORAGE_STATE_DIR).mkdir(parents=True, exist_ok=True)
-
-_admin_users_env = os.getenv("ADMIN_USERS", "").strip()
 
 def _load_admins() -> Set[int]:
     s = set()
@@ -73,8 +111,9 @@ def _load_admins() -> Set[int]:
     if os.path.exists(ADMIN_USERS_FILE):
         try:
             with open(ADMIN_USERS_FILE, "r") as f:
-                s.update(int(x) for x in json.load(f) if str(x).isdigit())
-        except:
+                saved = json.load(f)
+                s.update(int(x) for x in saved if str(x).isdigit())
+        except Exception:
             pass
     return s
 
@@ -89,7 +128,8 @@ def load_sms_rate():
     if os.path.exists(RATE_CONFIG_FILE):
         try:
             with open(RATE_CONFIG_FILE, 'r') as f:
-                return float(json.load(f).get('rate', 0.0))
+                data = json.load(f)
+                return float(data.get('rate', 0.0))
         except:
             pass
     return 0.0
@@ -102,7 +142,8 @@ def load_min_withdraw():
     if os.path.exists(WITHDRAW_CONFIG_FILE):
         try:
             with open(WITHDRAW_CONFIG_FILE, 'r') as f:
-                return float(json.load(f).get('min', 10.0))
+                data = json.load(f)
+                return float(data.get('min', 10.0))
         except:
             pass
     return 10.0
@@ -114,6 +155,7 @@ def save_min_withdraw(min_val: float):
 SMS_RATE_BDT = load_sms_rate()
 MIN_WITHDRAW_BDT = load_min_withdraw()
 
+# ── Fake OTP config (list of dicts per platform) ────────────
 def load_fake_otp_config() -> Dict[str, List[Dict]]:
     if os.path.exists(FAKE_OTP_CONFIG_FILE):
         try:
@@ -125,6 +167,7 @@ def load_fake_otp_config() -> Dict[str, List[Dict]]:
                     if isinstance(val, list):
                         result[k] = val
                     elif isinstance(val, dict) and "country_name" in val:
+                        # migrate old single config to list
                         result[k] = [val]
                 return result
         except:
@@ -137,9 +180,9 @@ def save_fake_otp_config(config: Dict[str, List[Dict]]):
 
 FAKE_OTP_CONFIG = load_fake_otp_config()
 
+# ── Database (unchanged) ─────────────────────────────────────
 EXCHANGE_RATE = 125.0   # 1 USD = 125 BDT
 
-# ===================== DATABASE =====================
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('''
@@ -192,62 +235,56 @@ def init_db():
         ''')
     log.info("✅ Database initialised")
 
-def ensure_user_exists(uid: int):
+def ensure_user_exists(user_id: int):
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (uid,))
-
-def get_user_balance(uid: int) -> float:
-    ensure_user_exists(uid)
+        conn.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+def get_user_balance(user_id: int) -> float:
+    ensure_user_exists(user_id)
     with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute('SELECT balance_bdt FROM users WHERE user_id = ?', (uid,)).fetchone()
+        row = conn.execute('SELECT balance_bdt FROM users WHERE user_id = ?', (user_id,)).fetchone()
     return row[0] if row else 0.0
-
-def get_user_wallet(uid: int) -> dict:
+def get_user_wallet(user_id: int) -> dict:
     with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute('SELECT bkash, rocket, binance FROM users WHERE user_id = ?', (uid,)).fetchone()
+        row = conn.execute('SELECT bkash, rocket, binance FROM users WHERE user_id = ?', (user_id,)).fetchone()
     if row:
         return {'bkash': row[0], 'rocket': row[1], 'binance': row[2]}
     return {'bkash': None, 'rocket': None, 'binance': None}
-
-def credit_user(uid: int, amount: float):
+def credit_user(user_id: int, amount: float):
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('UPDATE users SET balance_bdt = balance_bdt + ? WHERE user_id = ?', (amount, uid))
-
-def deduct_user(uid: int, amount: float):
+        conn.execute('UPDATE users SET balance_bdt = balance_bdt + ? WHERE user_id = ?', (amount, user_id))
+def deduct_user(user_id: int, amount: float):
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('UPDATE users SET balance_bdt = balance_bdt - ? WHERE user_id = ?', (amount, uid))
-
-def update_wallet(uid: int, wallet_type: str, number: str):
-    col = {'bkash': 'bkash', 'rocket': 'rocket', 'binance': 'binance'}.get(wallet_type)
+        conn.execute('UPDATE users SET balance_bdt = balance_bdt - ? WHERE user_id = ?', (amount, user_id))
+def update_wallet(user_id: int, wallet_type: str, number: str):
+    column_map = {'bkash': 'bkash', 'rocket': 'rocket', 'binance': 'binance'}
+    col = column_map.get(wallet_type)
     if col:
         with sqlite3.connect(DB_FILE) as conn:
-            conn.execute(f'UPDATE users SET {col} = ? WHERE user_id = ?', (number, uid))
-
-def create_withdrawal(uid: int, method: str, account: str, amount: float) -> int:
+            conn.execute(f'UPDATE users SET {col} = ? WHERE user_id = ?', (number, user_id))
+def create_withdrawal(user_id: int, method: str, account: str, amount: float) -> int:
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.execute(
             'INSERT INTO withdrawals (user_id, method, account, amount) VALUES (?,?,?,?)',
-            (uid, method, account, amount)
+            (user_id, method, account, amount)
         )
         return cur.lastrowid
-
 def get_pending_withdrawals():
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        return conn.execute("SELECT * FROM withdrawals WHERE status = 'pending'").fetchall()
-
+        rows = conn.execute('SELECT * FROM withdrawals WHERE status = ?', ('pending',)).fetchall()
+    return rows
 def get_approved_withdrawals():
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        return conn.execute("SELECT * FROM withdrawals WHERE status = 'approved' ORDER BY approved_at DESC").fetchall()
-
-def approve_withdrawal(withdrawal_id: int) -> bool:
+        rows = conn.execute('SELECT * FROM withdrawals WHERE status = ? ORDER BY approved_at DESC', ('approved',)).fetchall()
+    return rows
+def approve_withdrawal(withdrawal_id: int):
     with sqlite3.connect(DB_FILE) as conn:
         row = conn.execute('SELECT user_id, amount FROM withdrawals WHERE id = ?', (withdrawal_id,)).fetchone()
         if not row:
             return False
-        uid, amount = row
-        deduct_user(uid, amount)
+        user_id, amount = row
+        deduct_user(user_id, amount)
         conn.execute(
             "UPDATE withdrawals SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE id = ?",
             (withdrawal_id,)
@@ -255,16 +292,17 @@ def approve_withdrawal(withdrawal_id: int) -> bool:
         conn.commit()
         return True
 
-def update_user_stats(uid: int, earned: float = 0.0, otp_count: int = 0, numbers_used: int = 0):
+# ── Stats helpers ─────────────────────────────────────────────
+def update_user_stats(user_id: int, earned: float = 0.0, otp_count: int = 0, numbers_used: int = 0):
     today_str = date.today().isoformat()
     with sqlite3.connect(DB_FILE) as conn:
-        ensure_user_exists(uid)
-        row = conn.execute('SELECT last_otp_date, today_otps, today_earned FROM users WHERE user_id = ?', (uid,)).fetchone()
-        last_date = row[0] if row else None
+        ensure_user_exists(user_id)
+        row = conn.execute('SELECT last_otp_date, today_otps, today_earned FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        last_date = row[0]
         if last_date != today_str:
             conn.execute('''UPDATE users SET today_otps = ?, today_earned = ?, last_otp_date = ?,
                             numbers_used = numbers_used + ? WHERE user_id = ?''',
-                         (otp_count, earned, today_str, numbers_used, uid))
+                         (otp_count, earned, today_str, numbers_used, user_id))
         else:
             conn.execute('''UPDATE users SET total_otps = total_otps + ?,
                             today_otps = today_otps + ?,
@@ -272,13 +310,12 @@ def update_user_stats(uid: int, earned: float = 0.0, otp_count: int = 0, numbers
                             today_earned = today_earned + ?,
                             numbers_used = numbers_used + ?
                             WHERE user_id = ?''',
-                         (otp_count, otp_count, earned, earned, numbers_used, uid))
-
-def get_user_stats(uid: int) -> Dict:
-    ensure_user_exists(uid)
+                         (otp_count, otp_count, earned, earned, numbers_used, user_id))
+def get_user_stats(user_id: int) -> Dict:
+    ensure_user_exists(user_id)
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        row = conn.execute('SELECT * FROM users WHERE user_id = ?', (uid,)).fetchone()
+        row = conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)).fetchone()
         if not row:
             return {}
         today = date.today().isoformat()
@@ -288,7 +325,7 @@ def get_user_stats(uid: int) -> Dict:
         else:
             today_otps = row['today_otps']
             today_earned = row['today_earned']
-        total_withdrawn = sum_withdrawals_for_user(uid)
+        total_withdrawn = sum_withdrawals_for_user(user_id)
         return {
             'numbers_used': row['numbers_used'],
             'today_otps': today_otps,
@@ -298,16 +335,14 @@ def get_user_stats(uid: int) -> Dict:
             'total_withdrawn_bdt': total_withdrawn,
             'balance_bdt': row['balance_bdt']
         }
-
-def sum_withdrawals_for_user(uid: int) -> float:
+def sum_withdrawals_for_user(user_id: int) -> float:
     with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute("SELECT SUM(amount) FROM withdrawals WHERE user_id = ? AND status = 'approved'", (uid,)).fetchone()
+        row = conn.execute("SELECT SUM(amount) FROM withdrawals WHERE user_id = ? AND status = 'approved'", (user_id,)).fetchone()
     return row[0] or 0.0
-
-def get_all_user_ids() -> List[int]:
+def get_all_user_ids() -> list[int]:
     with sqlite3.connect(DB_FILE) as conn:
-        return [row[0] for row in conn.execute('SELECT user_id FROM users').fetchall()]
-
+        rows = conn.execute('SELECT user_id FROM users').fetchall()
+    return [row[0] for row in rows]
 def get_admin_stats() -> Dict:
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
@@ -331,27 +366,32 @@ def get_admin_stats() -> Dict:
             'total_withdrawn_bdt': total_withdrawn
         }
 
-def store_credentials(uid: int, site: str, email: str, password: str):
+# ── Credentials helpers ───────────────────────────────────────
+def store_credentials(user_id: int, site: str, email: str, password: str):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('INSERT OR REPLACE INTO user_credentials (user_id, site, email, password) VALUES (?,?,?,?)',
-                     (uid, site, email, password))
-
-def get_credentials(uid: int, site: str) -> Optional[Tuple[str, str]]:
+                     (user_id, site, email, password))
+def get_credentials(user_id: int, site: str) -> Optional[Tuple[str, str]]:
     with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute('SELECT email, password FROM user_credentials WHERE user_id = ? AND site = ?', (uid, site)).fetchone()
+        row = conn.execute('SELECT email, password FROM user_credentials WHERE user_id = ? AND site = ?', (user_id, site)).fetchone()
     return row if row else None
-
-def remove_credentials(uid: int, site: str):
+def remove_credentials(user_id: int, site: str):
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute('DELETE FROM user_credentials WHERE user_id = ? AND site = ?', (uid, site))
-    if uid in _user_pages:
-        page = _user_pages[uid].pop(site, None)
-        if page:
-            asyncio.create_task(_safe_close_page(page))
-        if not _user_pages[uid]:
-            del _user_pages[uid]
+        conn.execute('DELETE FROM user_credentials WHERE user_id = ? AND site = ?', (user_id, site))
+    async def _close_user_page():
+        if user_id in _user_pages:
+            pages = _user_pages[user_id]
+            if site in pages:
+                page = pages.pop(site)
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if not pages:
+                del _user_pages[user_id]
+    asyncio.create_task(_close_user_page())
 
-# ===================== SITES =====================
+# ── Site definitions ─────────────────────────────────────────
 SITES = {
     "stexsms": {
         "name": "StexSMS",
@@ -369,7 +409,9 @@ POLL_INTERVAL   = 3
 MONITOR_TIMEOUT = 480
 FETCH_RETRIES   = 3
 
-# ===================== LOGGING =====================
+# ═══════════════════════════════════════════════════════════════
+#  LOGGING – essential INFO only, no DEBUG from smsbot
+# ═══════════════════════════════════════════════════════════════
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -380,16 +422,18 @@ logging.getLogger("telegram._bot").setLevel(logging.WARNING)
 log = logging.getLogger("smsbot")
 log.setLevel(logging.INFO)
 
-# ===================== GLOBAL STATE =====================
+# ═══════════════════════════════════════════════════════════════
+#  GLOBAL STATE
+# ═══════════════════════════════════════════════════════════════
 user_sessions: dict[int, dict] = {}
 _playwright_obj = None
 _browser        = None
 _browser_lock   = asyncio.Lock()
 _page_lock      = asyncio.Lock()
-GLOBAL_CONTEXTS: Dict[str, any] = {}
-GLOBAL_STORAGE_PATHS: Dict[str, str] = {}
+_global_pages: Dict[str, Page] = {}
 _user_pages: Dict[int, Dict[str, Page]] = {}
 
+# Fake details data
 MALE_NAMES   = ["Liam","Noah","Oliver","Elijah","James","William","Benjamin","Lucas","Henry","Alexander",
                 "Mason","Michael","Ethan","Daniel","Jacob","Logan","Jackson","Levi","Sebastian","Mateo",
                 "Jack","Owen","Theodore","Aiden","Samuel","Joseph","John","David","Wyatt","Matthew","Luke",
@@ -407,11 +451,14 @@ LAST_NAMES   = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","
                 "Hill","Flores","Green","Adams","Nelson","Baker","Hall","Rivera","Campbell","Mitchell",
                 "Carter","Roberts"]
 
+# ── Fake OTP globals ─────────────────────────────────────────
 auto_fake_running = False
 auto_fake_task: Optional[asyncio.Task] = None
 BOT_USERNAME: Optional[str] = None
 
-# ===================== HEALTH SERVER =====================
+# ═══════════════════════════════════════════════════════════════
+#  HEALTH‑CHECK HTTP SERVER (for Railway)
+# ═══════════════════════════════════════════════════════════════
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -426,13 +473,9 @@ def start_health_server(port: int):
     thread.start()
     log.info(f"🌐 Health server listening on port {port}")
 
-# ===================== HEARTBEAT =====================
-async def heartbeat_logger(app: Application):
-    while True:
-        await asyncio.sleep(1800)  # 30 minutes
-        log.info("💓 Bot heartbeat – still alive")
-
-# ===================== HELPERS =====================
+# ═══════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════
 def _stop_monitor(uid: int):
     s = user_sessions.get(uid, {})
     task = s.get("monitor_task")
@@ -491,11 +534,9 @@ def generate_identity(gender: str) -> dict:
     password = ''.join(base) + day_str
     return {"name": full_name, "username": username, "password": password, "gender": gender}
 
-async def _safe_close_page(page):
-    try: await page.close()
-    except: pass
-
-# ===================== FORCED GROUP MEMBERSHIP =====================
+# ═══════════════════════════════════════════════════════════════
+#  FORCED GROUP MEMBERSHIP
+# ═══════════════════════════════════════════════════════════════
 async def _check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     try:
@@ -506,7 +547,7 @@ async def _check_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         pass
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("Join Channel", url=OTP_GROUP_LINK),
-        InlineKeyboardButton("Verify", callback_data="verify_membership")
+        InlineKeyboardButton("Verify", callback_data="verify_membership", style="primary")
     ]])
     if update.message:
         await update.message.reply_text("🔒 Access Restricted!\n\nPlease join our channel to use this bot.", reply_markup=kb)
@@ -523,155 +564,101 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
     except BadRequest: pass
     await query.answer("You are not yet a member of the channel.", show_alert=True)
 
-# ===================== PERSISTENT BROWSER =====================
+# ═══════════════════════════════════════════════════════════════
+#  BROWSER / SCRAPER – improved error handling & retries
+# ═══════════════════════════════════════════════════════════════
 async def _ensure_playwright():
-    global _playwright_obj, _browser, GLOBAL_CONTEXTS
+    global _playwright_obj, _browser
     async with _browser_lock:
         if _playwright_obj is None or (_browser is not None and not _browser.is_connected()):
-            if _playwright_obj:
-                await _playwright_obj.stop()
+            if _playwright_obj: await _playwright_obj.stop()
             _playwright_obj = await async_playwright().start()
             _browser = await _playwright_obj.chromium.launch(
                 headless=True,
                 args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-blink-features=AutomationControlled"]
             )
-            # Close any old contexts
-            for ctx in GLOBAL_CONTEXTS.values():
-                try: await ctx.close()
-                except: pass
-            GLOBAL_CONTEXTS.clear()
-
-async def _get_global_site_context(site: str):
-    """Return a persistent context for the site, logged in with global credentials."""
-    await _ensure_playwright()
-    path = os.path.join(STORAGE_STATE_DIR, f"{site}_global.json")
-    GLOBAL_STORAGE_PATHS[site] = path
-
-    if site in GLOBAL_CONTEXTS:
-        ctx = GLOBAL_CONTEXTS[site]
-        try:
-            # Quick check if still logged in
-            page = await ctx.new_page()
-            await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=15000)
-            if await page.locator(".user-dropdown, table.gn-tbl").count() > 0:
-                await page.close()
-                return ctx
-            await page.close()
-        except:
-            pass
-        # Expired, close old context
-        try: await ctx.close()
-        except: pass
-        del GLOBAL_CONTEXTS[site]
-
-    # Load saved storage state
-    storage_state = None
-    if os.path.exists(path):
-        try:
-            with open(path, 'r') as f:
-                storage_state = json.load(f)
-        except:
-            pass
-
-    ctx = await _browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        viewport={"width":1280,"height":800},
-        storage_state=storage_state
-    )
-    await ctx.grant_permissions(["clipboard-read"])
-
-    # Verify login
-    page = await ctx.new_page()
-    await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=15000)
-    logged_in = await page.locator(".user-dropdown, table.gn-tbl").count() > 0
-    await page.close()
-
-    if not logged_in:
-        # Need to login
-        page = await ctx.new_page()
-        try:
-            await page.goto(SITES[site]["login_url"], wait_until="networkidle", timeout=30000)
-            await page.fill("input[type='email']", SMS_EMAIL)
-            await page.fill("input[type='password']", SMS_PASSWORD)
-            await page.click("button[type='submit']")
-            await page.wait_for_url(lambda u: "auth" not in u and "login" not in u, timeout=60000)
-        except:
-            try:
-                await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=10000)
-            except:
-                await page.close()
-                await ctx.close()
-                raise Exception(f"Global login failed for {site}")
-        await page.close()
-        # Save new storage state
-        storage = await ctx.storage_state()
-        with open(path, 'w') as f:
-            json.dump(storage, f)
-
-    GLOBAL_CONTEXTS[site] = ctx
-    return ctx
-
-async def _get_page_for_global(site: str) -> Page:
-    """Get a fresh page from the global persistent context, navigated to dialer URL."""
-    ctx = await _get_global_site_context(site)
-    page = await ctx.new_page()
-    await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
-    return page
+            if _browser is None:
+                raise RuntimeError("Chromium launch failed – check Playwright/Docker version")
 
 async def _login_with_credentials(page: Page, site: str, email: str, password: str) -> bool:
+    site_cfg = SITES[site]
     try:
-        await page.goto(SITES[site]["login_url"], wait_until="networkidle", timeout=30000)
+        await page.goto(site_cfg["login_url"], wait_until="networkidle", timeout=30000)
         await page.fill("input[type='email']", email)
         await page.fill("input[type='password']", password)
         await page.click("button[type='submit']")
         try:
-            await page.wait_for_url(lambda u: "auth" not in u and "login" not in u, timeout=60000)
+            await page.wait_for_url(lambda url: "auth" not in url and "login" not in url, timeout=60000)
             return True
-        except:
-            if "/dialer/" in page.url:
-                return True
+        except Exception:
+            if "/dialer/" in page.url: return True
             try:
+                # Wait for a reliable logged‑in element (e.g., user icon, number table)
                 await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=10000)
                 return True
-            except:
-                pass
+            except Exception: pass
         return False
-    except Exception:
+    except Exception as e:
+        log.error(f"Login error: {e}")
         return False
 
 async def _ensure_page_logged_in(site: str, user_id: int = None) -> Page:
-    """Return a logged-in page. For global accounts, use persistent context."""
-    if user_id is None or get_credentials(user_id, site) is None:
-        # Global account
-        return await _get_page_for_global(site)
-    else:
-        # User custom account
+    """Returns a page that is **certainly** logged in. On failure, the page is closed and removed before raising."""
+    await _ensure_playwright()
+    creds = None
+    if user_id:
         creds = get_credentials(user_id, site)
+    if creds:
         user_pages = _user_pages.setdefault(user_id, {})
         page = user_pages.get(site)
         if page is None or page.is_closed():
-            ctx = await _browser.new_context(viewport={"width":1280,"height":800})
-            await ctx.grant_permissions(["clipboard-read"])
-            page = await ctx.new_page()
+            context = await _browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width":1280,"height":800})
+            await context.grant_permissions(["clipboard-read"])
+            page = await context.new_page()
             user_pages[site] = page
             if not await _login_with_credentials(page, site, creds[0], creds[1]):
                 await page.close()
                 del user_pages[site]
                 raise Exception(f"Login failed for {site} with custom credentials")
         else:
-            # Verify still logged in
+            # Verify that the page is actually logged in (not just missing 'login' in URL)
             try:
                 await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=5000)
             except:
+                # Not logged in – try to re‑login
                 if not await _login_with_credentials(page, site, creds[0], creds[1]):
                     await page.close()
                     del user_pages[site]
                     raise Exception(f"Re‑login failed for {site}")
-        await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
-        return page
+    else:
+        page = _global_pages.get(site)
+        if page is None or page.is_closed():
+            context = await _browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width":1280,"height":800})
+            await context.grant_permissions(["clipboard-read"])
+            page = await context.new_page()
+            _global_pages[site] = page
+            if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
+                await page.close()
+                # Use pop to avoid KeyError
+                _global_pages.pop(site, None)
+                raise Exception(f"Global login failed for {site}")
+        else:
+            try:
+                await page.wait_for_selector(".user-dropdown, table.gn-tbl", timeout=5000)
+            except:
+                if not await _login_with_credentials(page, site, SMS_EMAIL, SMS_PASSWORD):
+                    await page.close()
+                    _global_pages.pop(site, None)
+                    raise Exception(f"Global re‑login failed for {site}")
+    await page.goto(SITES[site]["dialer_url"], wait_until="domcontentloaded", timeout=20000)
+    return page
 
-# ===================== FETCH & POLL =====================
 async def fetch_number(range_str: str, site: str, user_id: int = None) -> Optional[dict]:
+    """Try to fetch a number up to FETCH_RETRIES times."""
     last_exception = None
     for attempt in range(1, FETCH_RETRIES+1):
         try:
@@ -692,7 +679,7 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
                     await page.wait_for_function(
                         """(old)=>{const r=document.querySelectorAll('table.gn-tbl tbody tr');
                         for(let i=0;i<r.length;i++){let n=r[i].querySelector('.gn-num');
-                        if(n&&n.textContent.trim().replace(/^\\+/,'')!==old)return true;}return false;}""",
+                        if(n&&n.textContent.trim().replace(/^\\+/,'')!==old)return true;break;}return false;}""",
                         arg=old_number or "", timeout=15000)
                 except PlaywrightTimeoutError:
                     return None
@@ -708,13 +695,19 @@ async def fetch_number(range_str: str, site: str, user_id: int = None) -> Option
         except Exception as e:
             log.error(f"❌ fetch_number attempt {attempt} error: {e}")
             last_exception = e
-            # Clean up stale page
+            # Clean up the problematic page so the next attempt gets a fresh one
             if user_id and user_id in _user_pages:
-                pg = _user_pages[user_id].pop(site, None)
-                if pg:
-                    await _safe_close_page(pg)
+                page = _user_pages[user_id].pop(site, None)
+                if page:
+                    try: await page.close()
+                    except: pass
                 if not _user_pages[user_id]:
                     del _user_pages[user_id]
+            else:
+                page = _global_pages.pop(site, None)
+                if page:
+                    try: await page.close()
+                    except: pass
             await asyncio.sleep(1)
     log.error(f"❌ All {FETCH_RETRIES} fetch attempts failed. Last error: {last_exception}")
     return None
@@ -748,7 +741,9 @@ async def poll_otp(number: str, site: str, user_id: int = None) -> Optional[str]
         log.error(f"❌ poll_otp error: {e}")
         return None
 
-# ===================== MONITOR TASK =====================
+# ═══════════════════════════════════════════════════════════════
+#  MONITOR TASK
+# ═══════════════════════════════════════════════════════════════
 async def monitor_number(app: Application, uid: int, number: str, country: str, operator: str, site: str):
     loop = asyncio.get_event_loop()
     deadline = loop.time() + MONITOR_TIMEOUT
@@ -780,113 +775,123 @@ async def monitor_number(app: Application, uid: int, number: str, country: str, 
                     f"💬 Message: {safe_msg}\n\n"
                     f"{bal_line}"
                 )
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", copy_text=CopyTextButton(text=clean_otp))]])
-                try: await app.bot.send_message(uid, user_text, parse_mode="Markdown", reply_markup=kb)
+                if COPY_SUPPORTED:
+                    user_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", copy_text=CopyTextButton(text=clean_otp),style="success")]])
+                else:
+                    user_kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"OTP: {clean_otp}", callback_data=f"copy_otp_{clean_otp}", style="primary")]])
+                try: await app.bot.send_message(uid, user_text, parse_mode="Markdown", reply_markup=user_kb)
                 except Exception as e: log.error(f"❌ DM OTP error: {e}")
                 masked_num = _mask_number(f"+{number}")
                 group_text = f"📨 {country} OTP Received\n━━━━━━━━━━━━━━━━\n📞 Number: {masked_num}\n🔑 OTP: {clean_otp}\n\n💬 {clean_msg}\n━━━━━━━━━━━━━━━━"
-                grp_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Get Number", url=f"https://t.me/{bot_user.username}?start=start")]])
-                try: await app.bot.send_message(OTP_GROUP_ID, group_text, reply_markup=grp_kb)
+                bot_link = f"https://t.me/{bot_user.username}?start=start"
+                group_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Get Number", url=bot_link)]])
+                try: await app.bot.send_message(OTP_GROUP_ID, group_text, reply_markup=group_kb)
                 except Exception as e: log.error(f"❌ Group OTP error: {e}")
         await asyncio.sleep(POLL_INTERVAL)
 
-# ===================== KEYBOARDS =====================
+# ═══════════════════════════════════════════════════════════════
+#  KEYBOARDS (coloured)
+# ═══════════════════════════════════════════════════════════════
 def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
     btns = [
-        [KeyboardButton("📡 Get Number"), KeyboardButton("🔑 Get 2FA")],
-        [KeyboardButton("📋 Fake Details"), KeyboardButton("💰 Balance")],
-        [KeyboardButton("📊 Status"), KeyboardButton("👤 Accounts")]
+        [KeyboardButton("📡 Get Number", style="success"), KeyboardButton("🔑 Get 2FA", style="primary")],
+        [KeyboardButton("📋 Fake Details", style="primary"), KeyboardButton("💰 Balance", style="success")],
+        [KeyboardButton("📊 Status", style="success"), KeyboardButton("👤 Accounts", style="primary")]
     ]
     if _is_admin(uid):
-        btns.append([KeyboardButton("⚙️ Admin Panel")])
+        btns.append([KeyboardButton("⚙️ Admin Panel", style="primary")])
     return ReplyKeyboardMarkup(btns, resize_keyboard=True)
 
 def site_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🔵 Stexsms"), KeyboardButton("🔵 Voltxsms")],
-        [KeyboardButton("🔙 Back")]
+        [KeyboardButton("🔵 Stexsms", style="primary"), KeyboardButton("🔵 Voltxsms", style="primary")],
+        [KeyboardButton("🔙 Back", style="danger")]
     ], resize_keyboard=True)
 
 def admin_menu_kb(uid: int) -> ReplyKeyboardMarkup:
     btns = [
-        [KeyboardButton("Interval")],
-        [KeyboardButton("Set SMS Rate"), KeyboardButton("Set Withdraw Rate")],
-        [KeyboardButton("Pending"), KeyboardButton("Approved")],
-        [KeyboardButton("Users Status"), KeyboardButton("Broadcast")],
-        [KeyboardButton("📨 Fake OTP")]
+        [KeyboardButton("Interval", style="primary")],
+        [KeyboardButton("Set SMS Rate", style="success"), KeyboardButton("Set Withdraw Rate", style="primary")],
+        [KeyboardButton("Pending", style="primary"), KeyboardButton("Approved", style="success")],
+        [KeyboardButton("Users Status", style="success"), KeyboardButton("Broadcast", style="primary")],
+        [KeyboardButton("📨 Fake OTP", style="danger")]
     ]
     if _is_owner(uid):
-        btns.append([KeyboardButton("Admin Set")])
-    btns.append([KeyboardButton("🔙 Back")])
+        btns.append([KeyboardButton("Admin Set", style="primary")])
+    btns.append([KeyboardButton("🔙 Back", style="danger")])
     return ReplyKeyboardMarkup(btns, resize_keyboard=True)
 
 def admin_set_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([
-        [KeyboardButton("Add Admin"), KeyboardButton("Remove Admin")],
-        [KeyboardButton("🔙 Back")]
+        [KeyboardButton("Add Admin", style="primary"), KeyboardButton("Remove Admin", style="primary")],
+        [KeyboardButton("🔙 Back", style="danger")]
     ], resize_keyboard=True)
 
 def number_ready_kb(number: str) -> InlineKeyboardMarkup:
-    row1 = [InlineKeyboardButton("👥 OTP Group", url=OTP_GROUP_LINK),
-            InlineKeyboardButton("🔄 Change Number", callback_data="change_number")]
-    row2 = [InlineKeyboardButton("📋 Copy Number", copy_text=CopyTextButton(text=f"+{number}"))]
+    row1 = [InlineKeyboardButton("👥 OTP Group", url=OTP_GROUP_LINK ,style="success"),
+            InlineKeyboardButton("🔄 Change Number", callback_data="change_number", style="danger")]
+    if COPY_SUPPORTED:
+        row2 = [InlineKeyboardButton("📋 Copy Number", copy_text=CopyTextButton(text=f"+{number}"),style="success")]
+    else:
+        row2 = [InlineKeyboardButton("📋 Copy Number", callback_data=f"copy_num_{number}", style="success")]
     return InlineKeyboardMarkup([row1, row2])
 
 def balance_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Set Wallet", callback_data="profile_set_wallet"),
-         InlineKeyboardButton("Withdraw", callback_data="profile_withdraw")]
+        [InlineKeyboardButton("Set Wallet", callback_data="profile_set_wallet", style="primary"),
+         InlineKeyboardButton("Withdraw", callback_data="profile_withdraw", style="danger")]
     ])
 
 def wallet_type_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Bkash", callback_data="wallet_bkash"),
-         InlineKeyboardButton("Rocket", callback_data="wallet_rocket")],
-        [InlineKeyboardButton("Binance", callback_data="wallet_binance")]
+        [InlineKeyboardButton("Bkash", callback_data="wallet_bkash", style="primary"),
+         InlineKeyboardButton("Rocket", callback_data="wallet_rocket", style="primary")],
+        [InlineKeyboardButton("Binance", callback_data="wallet_binance", style="primary")]
     ])
 
 def withdraw_method_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Bkash", callback_data="withdraw_method_bkash"),
-         InlineKeyboardButton("Rocket", callback_data="withdraw_method_rocket")],
-        [InlineKeyboardButton("Binance", callback_data="withdraw_method_binance"),
-         InlineKeyboardButton("Mobile Recharge", callback_data="withdraw_method_mobile")]
+        [InlineKeyboardButton("Bkash", callback_data="withdraw_method_bkash", style="primary"),
+         InlineKeyboardButton("Rocket", callback_data="withdraw_method_rocket", style="primary")],
+        [InlineKeyboardButton("Binance", callback_data="withdraw_method_binance", style="primary"),
+         InlineKeyboardButton("Mobile Recharge", callback_data="withdraw_method_mobile", style="primary")]
     ])
 
 def login_site_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("StexSMS", callback_data="login_site_stexsms"),
-         InlineKeyboardButton("VoltxSMS", callback_data="login_site_voltxsms")]
+        [InlineKeyboardButton("StexSMS", callback_data="login_site_stexsms", style="primary"),
+         InlineKeyboardButton("VoltxSMS", callback_data="login_site_voltxsms", style="primary")]
     ])
 
 def accounts_options_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 Log In", callback_data="accounts_login"),
-         InlineKeyboardButton("🚪 Log Out", callback_data="accounts_logout")]
+        [InlineKeyboardButton("🔑 Log In", callback_data="accounts_login", style="success"),
+         InlineKeyboardButton("🚪 Log Out", callback_data="accounts_logout", style="danger")]
     ])
 
 def logout_site_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("StexSMS", callback_data="logout_site_stexsms"),
-         InlineKeyboardButton("VoltxSMS", callback_data="logout_site_voltxsms")]
+        [InlineKeyboardButton("StexSMS", callback_data="logout_site_stexsms", style="danger"),
+         InlineKeyboardButton("VoltxSMS", callback_data="logout_site_voltxsms", style="danger")]
     ])
 
 def fake_otp_menu_kb() -> ReplyKeyboardMarkup:
     auto_label = "Auto: ON" if auto_fake_running else "Auto: OFF"
     return ReplyKeyboardMarkup([
-        [KeyboardButton("FB Send 5"), KeyboardButton("FB Send 6")],
-        [KeyboardButton("IG Send")],
-        [KeyboardButton(auto_label)],
-        [KeyboardButton("Set Details")],
-        [KeyboardButton("🔙 Back")]
+        [KeyboardButton("FB Send 5", style="primary"), KeyboardButton("FB Send 6", style="primary")],
+        [KeyboardButton("IG Send", style="primary")],
+        [KeyboardButton(auto_label, style="success")],
+        [KeyboardButton("Set Details", style="success")],
+        [KeyboardButton("🔙 Back", style="danger")]
     ], resize_keyboard=True)
 
 def fake_details_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Facebook", callback_data="set_fake_details_fb"),
-         InlineKeyboardButton("Instagram", callback_data="set_fake_details_ig")]
+        [InlineKeyboardButton("Facebook", callback_data="set_fake_details_fb", style="primary"),
+         InlineKeyboardButton("Instagram", callback_data="set_fake_details_ig", style="primary")]
     ])
 
+# ── Format balance message ────────────────────────────────────
 def format_balance_message(user_id: int) -> str:
     balance = get_user_balance(user_id)
     wallet = get_user_wallet(user_id)
@@ -902,7 +907,9 @@ def format_balance_message(user_id: int) -> str:
     )
     return text
 
-# ===================== FAKE OTP HELPERS =====================
+# ═══════════════════════════════════════════════════════════════
+#  FAKE OTP HELPERS (multi‑config support)
+# ═══════════════════════════════════════════════════════════════
 def generate_random_otp(length: int = 6) -> str:
     return ''.join(random.choices(string.digits, k=length))
 
@@ -1017,7 +1024,9 @@ def stop_auto_fake():
         auto_fake_task.cancel()
     auto_fake_task = None
 
-# ===================== CALLBACKS =====================
+# ═══════════════════════════════════════════════════════════════
+#  CALLBACKS
+# ═══════════════════════════════════════════════════════════════
 async def cb_change_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; uid=query.from_user.id
     now = time.time()
@@ -1028,7 +1037,7 @@ async def cb_change_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     range_str = user_sessions.get(uid,{}).get("last_range")
     site = user_sessions.get(uid,{}).get("site")
     if not range_str or not site:
-        await query.message.reply_text("❌ No previous range/site.", reply_markup=main_menu_kb(uid)); return
+        await query.message.reply_text("❌ No previous range/site. Use 📡 Get Number first.", reply_markup=main_menu_kb(uid)); return
     _stop_monitor(uid)
     user_sessions[uid]["last_change_time"] = now
     await query.message.reply_text("🔄 Fetching new number..."); await asyncio.sleep(CHANGE_NUMBER_DELAY)
@@ -1036,17 +1045,17 @@ async def cb_change_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if result:
         await _deliver_number(ctx.application, uid, result, site)
     else:
-        await query.message.reply_text("❌ No number found.", reply_markup=main_menu_kb(uid))
+        await query.message.reply_text("❌ No number found after several attempts.", reply_markup=main_menu_kb(uid))
 
 async def cb_copy_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data
     if data.startswith("copy_otp_"):
         val = data[9:]
-        await query.message.reply_text(f"🔑 *OTP:*\n`{val}`", parse_mode="Markdown")
+        await query.message.reply_text(f"🔑 *OTP:*\n`{val}`\n_(tap to copy)_", parse_mode="Markdown")
     elif data.startswith("copy_num_"):
         val = "+"+data[9:]
-        await query.message.reply_text(f"📋 *Number:*\n`{val}`", parse_mode="Markdown")
+        await query.message.reply_text(f"📋 *Number:*\n`{val}`\n_(tap to copy)_", parse_mode="Markdown")
 
 async def cb_gender_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -1063,12 +1072,22 @@ async def cb_change_fake_details(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def _send_identity_message(message, identity: dict, edit: bool=False):
     emoji = "👨" if identity["gender"]=="male" else "👩"
     text = f"{emoji} *Generated Identity*\n\n👤 *Name:* `{identity['name']}`\n🆔 *Username:* `{identity['username']}`\n🔑 *Password:* `{identity['password']}`\n\n📅 Password ends with today's date."
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Copy Name", copy_text=CopyTextButton(text=identity['name'])),
-         InlineKeyboardButton("📋 Copy User", copy_text=CopyTextButton(text=identity['username']))],
-        [InlineKeyboardButton("📋 Copy Pass", copy_text=CopyTextButton(text=identity['password']))],
-        [InlineKeyboardButton("🔄 Change Details", callback_data=f"change_fake_details_{identity['gender']}")]
-    ])
+    
+    if COPY_SUPPORTED:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Copy Name", copy_text=CopyTextButton(text=identity['name']), style="primary"),
+             InlineKeyboardButton("📋 Copy User", copy_text=CopyTextButton(text=identity['username']), style="primary")],
+            [InlineKeyboardButton("📋 Copy Pass", copy_text=CopyTextButton(text=identity['password']), style="success")],
+            [InlineKeyboardButton("🔄 Change Details", callback_data=f"change_fake_details_{identity['gender']}", style="danger")]
+        ])
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Copy Name", callback_data=f"copy_name_{identity['name']}", style="primary"),
+             InlineKeyboardButton("📋 Copy User", callback_data=f"copy_username_{identity['username']}", style="primary")],
+            [InlineKeyboardButton("📋 Copy Pass", callback_data=f"copy_password_{identity['password']}", style="success")],
+            [InlineKeyboardButton("🔄 Change Details", callback_data=f"change_fake_details_{identity['gender']}", style="danger")]
+        ])
+
     if edit:
         try:
             await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
@@ -1102,12 +1121,13 @@ async def cb_remove_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Admin {admin_id} removed.", show_alert=True)
         admins = [u for u in ADMIN_USERS if u!=OWNER_USER_ID]
         if admins:
-            new_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"Admin: {u}", callback_data=f"remove_admin_{u}")] for u in admins])
+            new_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"Admin: {u}", callback_data=f"remove_admin_{u}", style="danger")] for u in admins])
             try: await query.edit_message_reply_markup(reply_markup=new_markup)
             except: pass
         else: await query.edit_message_text("No more admins to remove.")
     else: await query.answer("Cannot remove this admin.", show_alert=True)
 
+# ── Accounts callbacks ───────────────────────────────────────
 async def cb_accounts_options(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data
@@ -1132,6 +1152,7 @@ async def cb_login_site_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     ctx.user_data['awaiting_login_email'] = True
     await query.message.reply_text(f"📧 Enter your *{SITES[site]['name']}* email address:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
+# ── Withdraw callbacks ──────────────────────────────────────
 async def cb_withdraw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     await query.message.reply_text("💸 *Select withdrawal method:*", parse_mode="Markdown", reply_markup=withdraw_method_kb())
@@ -1189,10 +1210,10 @@ async def cb_complete_withdrawal(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             f"🏦 Method: {method_display}\n"
             f"📞 Number: {w['account']}\n"
             f"✅ Status: Complete\n\n"
-            "We appreciate your trust!"
+            "We appreciate your trust! Share your experience or reach support below."
         )
         try: await ctx.bot.send_message(user_id, msg, parse_mode="Markdown")
-        except: pass
+        except Exception as e: log.error(f"Failed to notify user {user_id}: {e}")
     await query.answer("Withdrawal approved and user notified.", show_alert=True)
     await show_pending_withdrawals(query.message, ctx)
 
@@ -1210,7 +1231,7 @@ async def show_pending_withdrawals(message, ctx):
         )
     text = "\n".join(lines)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Complete", callback_data=f"complete_withdrawal_{w['id']}")] for w in pending
+        [InlineKeyboardButton("Complete", callback_data=f"complete_withdrawal_{w['id']}", style="success")] for w in pending
     ])
     await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
@@ -1228,6 +1249,7 @@ async def show_approved_withdrawals(message):
         )
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+# ── Wallet callbacks ─────────────────────────────────────────
 async def cb_set_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     await query.message.reply_text("📱 *Select wallet type to set:*", parse_mode="Markdown", reply_markup=wallet_type_kb())
@@ -1238,13 +1260,16 @@ async def cb_wallet_type_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ctx.user_data['wallet_type'] = wallet
     ctx.user_data['awaiting_wallet_number'] = True
     wallet_names = {'bkash': 'Bkash', 'rocket': 'Rocket', 'binance': 'Binance'}
-    await query.message.reply_text(f"📲 Send your *{wallet_names[wallet]}* number:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await query.message.reply_text(f"📲 Send your *{wallet_names[wallet]}* number (e.g., 01xxxxxxxxx):", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
 async def _update_2fa_countdown(message, code: str):
     remaining = 30
     while remaining > 0:
         text = f"🔐 *2FA Code Generated*\n\n🔢 Code: `{code}`\n⏳ Expires in: {remaining} seconds\n\n📌 This code refreshes every 30 seconds."
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Copy Code: {code}", copy_text=CopyTextButton(text=code))]])
+        if COPY_SUPPORTED:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Copy Code: {code}", copy_text=CopyTextButton(text=code))]])
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Copy Code: {code}", callback_data=f"copy_otp_{code}", style="primary")]])
         try: await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
         except BadRequest as e:
             if "message is not modified" not in str(e): break
@@ -1252,10 +1277,11 @@ async def _update_2fa_countdown(message, code: str):
         await asyncio.sleep(1)
         remaining -= 1
 
+# ── Fake OTP inline selection callback (fixed message-not-modified) ──
 async def cb_fake_send_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data
-    parts = data.split("_", 3)
+    parts = data.split("_", 3)  # ['fake','send','fb5','0']
     if len(parts)!=4 or parts[0]!="fake" or parts[1]!="send": return
     platform = parts[2]
     index = int(parts[3])
@@ -1265,9 +1291,15 @@ async def cb_fake_send_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cfg = configs[index]
         ok = await send_fake_otp(ctx.application, platform, cfg)
         new_text = f"✅ Sent {platform.upper()} OTP from {cfg['country_name']}." if ok else f"❌ Failed to send {platform.upper()} OTP."
+        # Avoid editing if the text would be identical (prevents BadRequest)
         if query.message.text != new_text:
-            try: await query.edit_message_text(new_text)
-            except BadRequest: pass
+            try:
+                await query.edit_message_text(new_text)
+            except BadRequest:
+                pass
+        else:
+            # Text is the same, just answer silently
+            pass
     else:
         await query.answer("Invalid selection.", show_alert=True)
 
@@ -1276,9 +1308,11 @@ async def cb_set_fake_details(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     platform = "fb" if "fb" in query.data else "ig"
     ctx.user_data['fake_otp_platform'] = platform
     ctx.user_data['awaiting_fake_country_name'] = True
-    await query.message.reply_text(f"🌍 Enter the *country name* for {platform.upper()} fake OTP:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await query.message.reply_text(f"🌍 Enter the *country name* for {platform.upper()} fake OTP (e.g., Guinea):", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
-# ===================== CONVERSATION HANDLERS =====================
+# ═══════════════════════════════════════════════════════════════
+#  CONVERSATION HANDLERS
+# ═══════════════════════════════════════════════════════════════
 MAIN_MENU, SITE_MENU, AWAIT_RANGE, ADMIN_MENU, SET_INTERVAL, ADMIN_SET_MENU, ADD_ADMIN_INPUT, \
 AWAIT_2FA_SECRET, SET_RATE, SET_WITHDRAW_RATE, \
 LOGIN_EMAIL, LOGIN_PASSWORD, BROADCAST_AWAIT = range(13)
@@ -1293,10 +1327,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await _check_membership(update, ctx): return ConversationHandler.END
+
     if not update.message or not update.message.text:
         return None
 
-    # Pending withdrawal flows
+    # ── pending withdrawal flows ──
     if ctx.user_data.get('awaiting_withdraw_account'):
         account = update.message.text.strip()
         ctx.user_data['withdraw_account'] = account
@@ -1351,7 +1386,7 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         email = update.message.text.strip()
         site = ctx.user_data.get('login_site')
         if not site:
-            await update.message.reply_text("❌ Session error.", reply_markup=main_menu_kb(uid))
+            await update.message.reply_text("❌ Session error. Start again.", reply_markup=main_menu_kb(uid))
             ctx.user_data.clear(); return MAIN_MENU
         ctx.user_data['login_email'] = email
         ctx.user_data['awaiting_login_email'] = False
@@ -1374,10 +1409,10 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 store_credentials(uid, site, email, password)
                 await update.message.reply_text(f"✅ Successfully logged in to {SITES[site]['name']}!", reply_markup=main_menu_kb(uid))
             else:
-                await update.message.reply_text("❌ Login failed.", reply_markup=main_menu_kb(uid))
+                await update.message.reply_text("❌ Login failed. Check your credentials.", reply_markup=main_menu_kb(uid))
         except Exception as e:
             log.error(f"Login test error: {e}")
-            await update.message.reply_text("❌ An error occurred.", reply_markup=main_menu_kb(uid))
+            await update.message.reply_text("❌ An error occurred. Please try again later.", reply_markup=main_menu_kb(uid))
         return MAIN_MENU
 
     text = update.message.text
@@ -1388,8 +1423,8 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📲 Paste your 2FA Secret Key", reply_markup=ReplyKeyboardRemove())
         return AWAIT_2FA_SECRET
     elif text == "📋 Fake Details":
-        gk = InlineKeyboardMarkup([[InlineKeyboardButton("🚹 Male", callback_data="gender_male"),
-                                    InlineKeyboardButton("🚺 Female", callback_data="gender_female")]])
+        gk = InlineKeyboardMarkup([[InlineKeyboardButton("🚹 Male", callback_data="gender_male", style="success"),
+                                    InlineKeyboardButton("🚺 Female", callback_data="gender_female", style="danger")]])
         await update.message.reply_text("👤 *Select gender for identity:*", parse_mode="Markdown", reply_markup=gk)
         return MAIN_MENU
     elif text == "💰 Balance":
@@ -1432,7 +1467,8 @@ async def main_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def login_password_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
     password = update.message.text.strip()
     site = ctx.user_data.get('login_site')
     email = ctx.user_data.get('login_email')
@@ -1458,13 +1494,17 @@ async def login_password_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 async def handle_2fa_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
     secret = update.message.text.strip()
     result = generate_2fa_code(secret)
     if result["success"]:
         code = result["code"]
         text = f"🔐 *2FA Code Generated*\n\n🔢 Code: `{code}`\n⏳ Expires in: 30 seconds\n\n📌 This code refreshes every 30 seconds."
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Copy Code: {code}", copy_text=CopyTextButton(text=code))]])
+        if COPY_SUPPORTED:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Copy Code: {code}", copy_text=CopyTextButton(text=code))]])
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Copy Code: {code}", callback_data=f"copy_otp_{code}", style="primary")]])
         sent_msg = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
         old_task = user_sessions.get(uid, {}).get("2fa_countdown_task")
         if old_task and not old_task.done(): old_task.cancel()
@@ -1477,10 +1517,11 @@ async def handle_2fa_secret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
     text = update.message.text.strip()
 
-    # Fake OTP flows
+    # ── Fake OTP flows (set details) ──
     if ctx.user_data.get('awaiting_fake_country_name'):
         country_name = text
         ctx.user_data['fake_country_name'] = country_name
@@ -1499,6 +1540,7 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ New fake OTP details for {platform.upper()} saved.", reply_markup=fake_otp_menu_kb())
         return ADMIN_MENU
 
+    # ── Fake OTP menu commands ──
     if ctx.user_data.get('in_fake_otp_menu'):
         if text in ("FB Send 5", "FB Send 6", "IG Send"):
             base = "fb" if text.startswith("FB") else "ig"
@@ -1536,7 +1578,7 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❓ Unknown command.", reply_markup=fake_otp_menu_kb())
             return ADMIN_MENU
 
-    # Regular admin menu
+    # ── Regular admin menu ──
     if text == "📨 Fake OTP":
         ctx.user_data['in_fake_otp_menu'] = True
         await update.message.reply_text("📨 *Fake OTP Controls*", parse_mode="Markdown", reply_markup=fake_otp_menu_kb())
@@ -1576,7 +1618,7 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="Markdown")
         return ADMIN_MENU
     elif text == "Broadcast":
-        await update.message.reply_text("📣 Send the message you want to broadcast. Type /cancel to abort.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("📣 Send the message you want to broadcast (text, photo, video, document, etc.). Type /cancel to abort.", reply_markup=ReplyKeyboardRemove())
         return BROADCAST_AWAIT
     elif text == "Admin Set" and _is_owner(uid):
         await update.message.reply_text("⚙️ *Admin Management*", parse_mode="Markdown", reply_markup=admin_set_menu_kb())
@@ -1588,7 +1630,8 @@ async def admin_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not update.message: return None
+    if not update.message:
+        return None
     if update.message.text and update.message.text == "/cancel":
         await update.message.reply_text("Broadcast cancelled.", reply_markup=admin_menu_kb(uid))
         return ADMIN_MENU
@@ -1598,16 +1641,19 @@ async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.copy(chat_id=user_id)
             success += 1
-        except: pass
+        except Exception:
+            pass
     await update.message.reply_text(f"✅ Broadcast sent to {success}/{len(all_users)} users.", reply_markup=admin_menu_kb(uid))
     return ADMIN_MENU
 
 async def set_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global SMS_RATE_BDT
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
     try:
-        rate = float(update.message.text.strip())
+        rate = float(text)
         if rate < 0: raise ValueError
         SMS_RATE_BDT = rate
         save_sms_rate(rate)
@@ -1620,9 +1666,11 @@ async def set_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def set_withdraw_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global MIN_WITHDRAW_BDT
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
     try:
-        min_val = float(update.message.text.strip())
+        min_val = float(text)
         if min_val < 0: raise ValueError
         MIN_WITHDRAW_BDT = min_val
         save_min_withdraw(min_val)
@@ -1634,7 +1682,8 @@ async def set_withdraw_rate_handler(update: Update, ctx: ContextTypes.DEFAULT_TY
 
 async def admin_set_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
     text = update.message.text
     if text == "Add Admin":
         await update.message.reply_text("👤 Send me the **user ID** to add as admin.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
@@ -1643,7 +1692,7 @@ async def admin_set_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         admins = [u for u in ADMIN_USERS if u!=OWNER_USER_ID]
         if not admins:
             await update.message.reply_text("No admins to remove.", reply_markup=admin_set_menu_kb()); return ADMIN_SET_MENU
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Admin: {u}", callback_data=f"remove_admin_{u}")] for u in admins])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Admin: {u}", callback_data=f"remove_admin_{u}", style="danger")] for u in admins])
         await update.message.reply_text("Select an admin to remove:", reply_markup=kb)
         return ADMIN_SET_MENU
     elif text == "🔙 Back":
@@ -1654,8 +1703,10 @@ async def admin_set_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def admin_set_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global ADMIN_USERS
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
-    try: new_id = int(update.message.text.strip())
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
+    try: new_id = int(text)
     except ValueError:
         await update.message.reply_text("❌ Invalid ID.", reply_markup=admin_set_menu_kb()); return ADMIN_SET_MENU
     ADMIN_USERS.add(new_id); _save_admins(ADMIN_USERS)
@@ -1665,9 +1716,11 @@ async def admin_set_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def admin_set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global CHANGE_NUMBER_DELAY
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
+    text = update.message.text.strip()
     try:
-        val = int(update.message.text.strip())
+        val = int(text)
         if val<1 or val>60: raise ValueError
         CHANGE_NUMBER_DELAY = val
         await update.message.reply_text(f"✅ Change‑Number delay set to `{val}` seconds.", parse_mode="Markdown", reply_markup=admin_menu_kb(uid))
@@ -1678,7 +1731,8 @@ async def admin_set_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def site_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
     text = update.message.text
     if text == "🔙 Back":
         await update.message.reply_text("🏠 Main menu:", reply_markup=main_menu_kb(uid)); return MAIN_MENU
@@ -1696,7 +1750,8 @@ async def site_menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not update.message or not update.message.text: return None
+    if not update.message or not update.message.text:
+        return None
     range_text = update.message.text.strip().upper()
     if "XXX" not in range_text:
         await update.message.reply_text("❌ Invalid format. Range must contain `XXX`.", parse_mode="Markdown"); return AWAIT_RANGE
@@ -1738,7 +1793,9 @@ async def _deliver_number(app_or_bot, uid, result, site, edit_msg=None):
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled exception:", exc_info=ctx.error)
 
-# ===================== MAIN =====================
+# ═══════════════════════════════════════════════════════════════
+#  MAIN – synchronous, proper event loop and shutdown
+# ═══════════════════════════════════════════════════════════════
 def main():
     global BOT_USERNAME
     if not BOT_TOKEN:
@@ -1752,17 +1809,15 @@ def main():
     log.info("⏳ Waiting 5 seconds to let old container release the polling lock...")
     time.sleep(5)
 
+    # Create and set event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-    # Get bot username
+    # Retrieve bot username
     BOT_USERNAME = loop.run_until_complete(app.bot.get_me()).username
     log.info(f"🤖 Bot username: @{BOT_USERNAME}")
-
-    # Start heartbeat
-    asyncio.ensure_future(heartbeat_logger(app), loop=loop)
 
     # Build conversation handler
     conv = ConversationHandler(
@@ -1804,7 +1859,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_set_fake_details, pattern="^set_fake_details_"))
     app.add_error_handler(error_handler)
 
-    # Shutdown
+    # Shutdown helper (coroutine)
     async def shutdown():
         log.info("🛑 Shutting down bot...")
         stop_auto_fake()
@@ -1818,6 +1873,7 @@ def main():
                 await _playwright_obj.stop()
         log.info("✅ Shutdown complete")
 
+    # Signal handlers
     def signal_handler():
         asyncio.ensure_future(shutdown(), loop=loop)
 
