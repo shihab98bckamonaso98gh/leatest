@@ -743,7 +743,9 @@ async def on_site_menu(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if site:
         user_sessions.setdefault(uid,{})["site"]=site; ctx.user_data["site"]=site
         last = user_sessions[uid].get("last_range","")
-        await upd.message.reply_text(f"✏️ *{SITES[site]['name']} – Send range:*\n\nExample: `2250163333XXX`\n⚠️ Must contain `XXX`{f'\n\n📌 Last: `{last}`' if last else ''}", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        # Fixed f-string – extracted variable to avoid backslash inside expression
+        last_part = f"\n\n📌 Last: `{last}`" if last else ""
+        await upd.message.reply_text(f"✏️ *{SITES[site]['name']} – Send range:*\n\nExample: `2250163333XXX`\n⚠️ Must contain `XXX`{last_part}", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         return AWAIT_RANGE
     return SITE_MENU
 
